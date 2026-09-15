@@ -1,0 +1,209 @@
+name: Build RustDesk 1.4.9 ARM64 V4L2M2M
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-arm64-v4l2.yml'
+      - 'scripts/**'
+      - 'README.md'
+
+env:
+  RUSTDESK_COMMIT: 6c578292e
+  RUST_VERSION: '1.75'
+  FLUTTER_VERSION: '3.24.5'
+  VCPKG_COMMIT_ID: 120deac3062162151622ca4860575a33844ba10b
+  VCPKG_BINARY_SOURCES: clear;x-gha,readwrite
+
+jobs:
+  bridge:
+    name: Generate Flutter bridge
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout helper repo
+        uses: actions/checkout@v4
+
+      - name: Checkout RustDesk 1.4.9
+        run: |
+          git clone --recursive https://github.com/rustdesk/rustdesk.git rustdesk
+          cd rustdesk
+          git checkout $RUSTDESK_COMMIT
+          git submodule update --init --recursive --force
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake curl gcc g++ libclang-dev libgtk-3-dev llvm-dev nasm ninja-build pkg-config wget
+
+      - name: Install Rust 1.75
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+
+      - name: Install Flutter 3.22.3 for bridge generation
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.22.3'
+          cache: true
+
+      - name: Generate bridge
+        working-directory: rustdesk
+        run: |
+          cargo install cargo-expand --version 1.0.95 --locked
+          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          pushd flutter
+          flutter pub get
+          popd
+          ~/.cargo/bin/flutter_rust_bridge_codegen \
+            --rust-input ./src/flutter_ffi.rs \
+            --dart-output ./flutter/lib/generated_bridge.dart \
+            --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+      - name: Upload bridge
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-artifact
+          path: |
+            rustdesk/src/bridge_generated.rs
+            rustdesk/src/bridge_generated.io.rs
+            rustdesk/flutter/lib/generated_bridge.dart
+            rustdesk/flutter/lib/generated_bridge.freezed.dart
+            rustdesk/flutter/macos/Runner/bridge_generated.h
+            rustdesk/flutter/ios/Runner/bridge_generated.h
+
+  build-arm64:
+    name: Build ARM64 DEB with V4L2M2M
+    needs: bridge
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - name: Checkout helper repo
+        uses: actions/checkout@v4
+
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout RustDesk 1.4.9
+        run: |
+          git clone --recursive https://github.com/rustdesk/rustdesk.git rustdesk
+          cd rustdesk
+          git checkout $RUSTDESK_COMMIT
+          git submodule update --init --recursive --force
+
+      - name: Apply V4L2M2M patch
+        run: bash scripts/apply-v4l2m2m-patch.sh rustdesk
+
+      - name: Restore bridge
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: rustdesk
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang cmake curl gcc git g++ \
+            libayatana-appindicator3-dev libasound2-dev libclang-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgtk-3-dev libpam0g-dev libpulse-dev libva-dev \
+            libxcb-randr0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxdo-dev libxfixes-dev llvm-dev nasm ninja-build \
+            pkg-config python3 rpm unzip wget xz-utils libssl-dev
+          sudo apt-get remove -y libopus-dev || true
+
+      - name: Install Rust 1.75
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-unknown-linux-gnu
+          components: rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rustdesk -> target
+          key: rustdesk-1.4.9-v4l2-arm64
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        working-directory: rustdesk
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: arm64-linux
+        run: |
+          $VCPKG_ROOT/vcpkg install \
+            --triplet arm64-linux \
+            --x-install-root="$VCPKG_ROOT/installed"
+          echo '===== FFmpeg V4L2 configure evidence ====='
+          grep -R -E 'enable-v4l2-m2m|h264_v4l2m2m' "$VCPKG_ROOT/buildtrees/ffmpeg" 2>/dev/null | head -50 || true
+
+      - name: Build Rust library
+        working-directory: rustdesk
+        run: |
+          sed -i 's/\["cdylib", "staticlib", "rlib"\]/["cdylib"]/g' Cargo.toml
+          export VCPKG_ROOT=/opt/artifacts/vcpkg
+          cargo build --locked --lib --jobs 3 --features hwcodec,flutter,unix-file-copy-paste --release
+          echo '===== Bundled hwcodec sanity ====='
+          cargo tree -p scrap --features hwcodec | grep -A2 -B2 hwcodec
+
+      - name: Prepare Flutter eLinux
+        run: |
+          cd /opt
+          sudo git clone https://github.com/sony/flutter-elinux.git
+          cd flutter-elinux
+          sudo git fetch --all
+          sudo git reset --hard $FLUTTER_VERSION
+
+          cd /opt
+          wget -q https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz
+          sudo tar xf flutter_linux_${FLUTTER_VERSION}-stable.tar.xz
+          sudo mkdir -p /opt/flutter-elinux/flutter/bin/cache/artifacts/engine/linux-arm64
+          sudo cp -R /opt/flutter/bin/cache/artifacts/engine/linux-x64/shader_lib /opt/flutter-elinux/flutter/bin/cache/artifacts/engine/linux-arm64/
+          sudo rm -rf /opt/flutter
+
+          cd /opt/flutter-elinux/flutter
+          sudo git apply $GITHUB_WORKSPACE/rustdesk/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+          /opt/flutter-elinux/bin/flutter-elinux doctor -v
+          /opt/flutter-elinux/bin/flutter-elinux precache --linux
+
+      - name: Build and package ARM64 DEB
+        working-directory: rustdesk
+        run: |
+          export PATH=/opt/flutter-elinux/bin:$PATH
+          export VCPKG_ROOT=/opt/artifacts/vcpkg
+          export DEB_ARCH=arm64
+          export CARGO_INCREMENTAL=0
+
+          sed -i 's/flutter build linux --release/flutter-elinux build linux --verbose/g' ./build.py
+          sed -i 's/x64\/release/arm64\/release/g' ./build.py
+
+          python3 ./build.py --flutter --skip-cargo
+
+          for name in rustdesk*??.deb; do
+            [ -e "$name" ] || continue
+            mv "$name" "${name%%.deb}-v4l2m2m-aarch64.deb"
+          done
+
+          ls -lh *.deb
+
+      - name: Upload ARM64 DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-1.4.9-v4l2m2m-aarch64
+          path: rustdesk/*v4l2m2m-aarch64.deb
+          if-no-files-found: error
