@@ -110,10 +110,11 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
+          sudo apt-get install -y libunwind-dev
           sudo apt-get install -y \
             build-essential clang cmake curl gcc git g++ \
             libayatana-appindicator3-dev libasound2-dev libclang-dev \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libunwind-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             libgtk-3-dev libpam0g-dev libpulse-dev libva-dev \
             libxcb-randr0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxdo-dev libxfixes-dev llvm-dev nasm ninja-build \
@@ -162,11 +163,16 @@ jobs:
 
       - name: Prepare Flutter eLinux
         run: |
+          sudo rm -rf /opt/flutter-elinux /opt/flutter
           cd /opt
           sudo git clone https://github.com/sony/flutter-elinux.git
-          cd flutter-elinux
-          sudo git fetch --all
-          sudo git reset --hard $FLUTTER_VERSION
+          sudo chown -R "$USER":"$USER" /opt/flutter-elinux
+          git config --global --add safe.directory /opt/flutter-elinux
+          git config --global --add safe.directory /opt/flutter-elinux/flutter
+
+          cd /opt/flutter-elinux
+          git fetch --all
+          git reset --hard "$FLUTTER_VERSION"
 
           cd /opt
           wget -q https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz
@@ -174,9 +180,10 @@ jobs:
           sudo mkdir -p /opt/flutter-elinux/flutter/bin/cache/artifacts/engine/linux-arm64
           sudo cp -R /opt/flutter/bin/cache/artifacts/engine/linux-x64/shader_lib /opt/flutter-elinux/flutter/bin/cache/artifacts/engine/linux-arm64/
           sudo rm -rf /opt/flutter
+          sudo chown -R "$USER":"$USER" /opt/flutter-elinux
 
           cd /opt/flutter-elinux/flutter
-          sudo git apply $GITHUB_WORKSPACE/rustdesk/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+          git apply $GITHUB_WORKSPACE/rustdesk/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
 
           /opt/flutter-elinux/bin/flutter-elinux doctor -v
           /opt/flutter-elinux/bin/flutter-elinux precache --linux
