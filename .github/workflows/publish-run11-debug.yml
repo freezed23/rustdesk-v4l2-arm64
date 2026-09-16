@@ -1,0 +1,56 @@
+name: Publish Run 11 Debug Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/publish-run11-debug.yml'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish-run11-debug:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download Run 11 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rustdesk-1.4.9-v4l2m2m-aarch64
+          path: release
+          repository: ${{ github.repository }}
+          run-id: 35064474480
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare diagnostic DEB
+        run: |
+          set -euxo pipefail
+          DEB="$(find release -type f -name '*.deb' -print -quit)"
+          test -n "$DEB"
+          mv "$DEB" release/rustdesk-1.4.9-v4l2m2m-run11-aarch64.deb
+          sha256sum release/rustdesk-1.4.9-v4l2m2m-run11-aarch64.deb
+          dpkg-deb --info release/rustdesk-1.4.9-v4l2m2m-run11-aarch64.deb | head -40
+
+      - name: Create separate Run 11 debug release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          TAG='run11-debug'
+          TARGET='c89741077df80d8dc1f8fab558da93b06c229b70'
+          DEB='release/rustdesk-1.4.9-v4l2m2m-run11-aarch64.deb'
+          NOTES='Diagnostic Run #11 build for Amlogic meson-vdec V4L2M2M testing. Includes [V4L2DBG] packet/send/receive/frame diagnostics and reduced startup failure grace. Experimental debug build; kept separate from the main v1.4.9-v4l2m2m release.'
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$DEB" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$DEB" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$TARGET" \
+              --title 'RustDesk 1.4.9 V4L2M2M Run 11 Debug' \
+              --notes "$NOTES"
+          fi
+
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,tagName,name,assets
