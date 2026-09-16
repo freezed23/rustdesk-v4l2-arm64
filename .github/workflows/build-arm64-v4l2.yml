@@ -101,6 +101,9 @@ jobs:
       - name: Apply V4L2M2M patch
         run: bash scripts/apply-v4l2m2m-patch.sh rustdesk
 
+      - name: Apply V4L2M2M runtime fixes
+        run: bash patches/apply-v4l2m2m-runtime-fix.sh rustdesk
+
       - name: Restore bridge
         uses: actions/download-artifact@v4
         with:
