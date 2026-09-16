@@ -7,6 +7,7 @@ on:
     paths:
       - '.github/workflows/build-arm64-v4l2.yml'
       - 'scripts/**'
+      - 'patches/**'
       - 'README.md'
 
 env:
@@ -181,9 +182,6 @@ jobs:
           wget -q https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz
           sudo tar xf flutter_linux_${FLUTTER_VERSION}-stable.tar.xz
 
-          # flutter-elinux must create its own Flutter SDK clone first. Creating
-          # /opt/flutter-elinux/flutter from the release tar before this causes
-          # update_flutter() to reject it because it has no .git directory.
           /opt/flutter-elinux/bin/flutter-elinux doctor -v
           /opt/flutter-elinux/bin/flutter-elinux precache --linux
 
