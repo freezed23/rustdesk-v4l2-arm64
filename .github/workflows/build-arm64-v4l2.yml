@@ -161,6 +161,19 @@ jobs:
           echo '===== FFmpeg V4L2 configure evidence ====='
           grep -R -E 'enable-v4l2-m2m|h264_v4l2m2m' "$VCPKG_ROOT/buildtrees/ffmpeg" 2>/dev/null | head -50 || true
 
+      - name: Check FFmpeg NV12M mapping
+        run: |
+          echo '===== SYSTEM HEADER ====='
+          grep -n 'V4L2_PIX_FMT_NV12M' /usr/include/linux/videodev2.h || true
+
+          echo '===== PREPROCESSOR ====='
+          printf '#include <linux/videodev2.h>\n#ifdef V4L2_PIX_FMT_NV12M\nNV12M_YES\n#else\nNV12M_NO\n#endif\n' \
+            | gcc -E - | tail -n 10
+
+          echo '===== FFMPEG SOURCE ====='
+          grep -R -n -A2 -B2 'V4L2_PIX_FMT_NV12M' \
+            /opt/artifacts/vcpkg/buildtrees/ffmpeg/src 2>/dev/null || true
+
       - name: Build Rust library
         working-directory: rustdesk
         run: |
