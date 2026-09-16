@@ -22,7 +22,7 @@ jobs:
           name: rustdesk-1.4.9-v4l2m2m-aarch64
           path: release
           repository: ${{ github.repository }}
-          run-id: 35040432142
+          run-id: 35051947500
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify DEB
@@ -41,17 +41,20 @@ jobs:
         run: |
           set -euxo pipefail
           TAG='v1.4.9-v4l2m2m'
-          TARGET='66f626607c00aaa38e7b13faee6af9e47c6ae230'
+          TARGET='846f474be026fbfd830506471941019edd721ce3'
           DEB="$(find release -type f -name '*.deb' -print -quit)"
 
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" "$DEB" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title 'RustDesk 1.4.9 ARM64 V4L2M2M' \
+              --notes 'Custom RustDesk 1.4.9 ARM64 build with Linux V4L2 M2M decoder paths for H.264, HEVC, VP9, and VP8. This build adds runtime handling for asynchronous V4L2M2M decode behavior and enables VP9/VP8 hwcodec data-format paths. H.264/HEVC/VP9 are intended for Amlogic meson_vdec where supported; VP8 falls back to software when the kernel driver does not expose VP8 decode.'
           else
             gh release create "$TAG" "$DEB" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$TARGET" \
               --title 'RustDesk 1.4.9 ARM64 V4L2M2M' \
-              --notes 'Custom RustDesk 1.4.9 ARM64 build with Linux V4L2 M2M decoder paths for H.264, HEVC, VP9, and VP8. H.264/HEVC/VP9 are intended for Amlogic meson_vdec where supported; VP8 falls back to software when the kernel driver does not expose VP8 decode.'
+              --notes 'Custom RustDesk 1.4.9 ARM64 build with Linux V4L2 M2M decoder paths for H.264, HEVC, VP9, and VP8. This build adds runtime handling for asynchronous V4L2M2M decode behavior and enables VP9/VP8 hwcodec data-format paths. H.264/HEVC/VP9 are intended for Amlogic meson_vdec where supported; VP8 falls back to software when the kernel driver does not expose VP8 decode.'
           fi
 
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,tagName,name,assets
