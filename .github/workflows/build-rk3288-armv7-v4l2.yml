@@ -1,0 +1,158 @@
+name: Build RustDesk 1.4.9 RK3288 ARMv7 V4L2M2M
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-rk3288-armv7-v4l2.yml'
+      - 'rk3288/**'
+      - 'scripts/apply-v4l2m2m-patch.sh'
+      - 'patches/apply-v4l2m2m-runtime-fix.sh'
+      - 'patches/apply-v4l2m2m-diagnostics.sh'
+
+env:
+  RUSTDESK_COMMIT: 6c578292e
+  SCITER_RUST_VERSION: '1.75'
+  SCITER_ARMV7_CMAKE_VERSION: '3.29.7'
+  SCITER_NASM_DEBVERSION: '2.15.05-1'
+  ARMV7_VCPKG_COMMIT_ID: 6f29f12e82a8293156836ad81cc9bf5af41fe836
+  VCPKG_BINARY_SOURCES: clear;x-gha,readwrite
+
+jobs:
+  build-rk3288-armv7:
+    name: Build RK3288 ARMv7 armhf DEB with V4L2M2M
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - name: Checkout helper repo
+        uses: actions/checkout@v4
+
+      - name: Checkout RustDesk 1.4.9
+        run: |
+          git clone --recursive https://github.com/rustdesk/rustdesk.git rustdesk
+          cd rustdesk
+          git checkout $RUSTDESK_COMMIT
+          git submodule update --init --recursive --force
+          sed -i 's/"baseline": ".*"/"baseline": "${{ env.ARMV7_VCPKG_COMMIT_ID }}"/' vcpkg.json
+
+      - name: Install host Rust toolchain metadata
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
+          targets: armv7-unknown-linux-gnueabihf
+          components: rustfmt
+
+      - name: Save Rust package version
+        run: |
+          RUST_TOOLCHAIN_VERSION=$(cargo --version | awk '{print $2}')
+          echo "RUST_TOOLCHAIN_VERSION=$RUST_TOOLCHAIN_VERSION" >> "$GITHUB_ENV"
+
+      - name: Build RK3288 ARMv7 package
+        uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8
+        with:
+          arch: armv7
+          distro: ubuntu18.04-rustdesk
+          githubToken: ${{ github.token }}
+          dockerRunArgs: |
+            --volume "${PWD}:/workspace"
+          shell: /bin/bash
+          install: |
+            apt-get update
+            apt-get install -y \
+              build-essential clang curl gcc git g++ \
+              libayatana-appindicator3-dev libasound2-dev libclang-dev \
+              libdbus-1-dev libglib2.0-dev libgstreamer1.0-dev \
+              libgstreamer-plugins-base1.0-dev libgtk-3-dev liblzma-dev \
+              libpam0g-dev libpulse-dev libva-dev libxcb-randr0-dev \
+              libxcb-shape0-dev libxcb-xfixes0-dev libxdo-dev libxfixes-dev \
+              ninja-build pkg-config python3 python3.7 rpm unzip wget xz-utils \
+              zip libssl-dev gcc-8 g++-8
+
+            git clone --depth 1 https://github.com/kitware/cmake -b "v${{ env.SCITER_ARMV7_CMAKE_VERSION }}" /tmp/cmake
+            pushd /tmp/cmake
+            ./bootstrap --generator='Unix Makefiles' "--prefix=/opt/cmake-${{ env.SCITER_ARMV7_CMAKE_VERSION }}-linux-armhf"
+            make -j1 install
+            popd
+            rm -rf /tmp/cmake
+            export PATH="/opt/cmake-${{ env.SCITER_ARMV7_CMAKE_VERSION }}-linux-armhf/bin:$PATH"
+
+            export VCPKG_ROOT=/opt/artifacts/vcpkg
+            mkdir -p /opt/artifacts
+            git clone https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
+            pushd "$VCPKG_ROOT"
+            git reset --hard ${{ env.ARMV7_VCPKG_COMMIT_ID }}
+            CC=/usr/bin/gcc-8 CXX=/usr/bin/g++-8 sh bootstrap-vcpkg.sh -disableMetrics
+            popd
+
+            pushd /opt
+            wget -O rust.tar.gz https://static.rust-lang.org/dist/rust-${{ env.RUST_TOOLCHAIN_VERSION }}-armv7-unknown-linux-gnueabihf.tar.gz
+            tar -zxvf rust.tar.gz > /dev/null
+            rm rust.tar.gz
+            cd rust-${{ env.RUST_TOOLCHAIN_VERSION }}-armv7-unknown-linux-gnueabihf
+            ./install.sh
+            cd /opt
+            rm -rf rust-${{ env.RUST_TOOLCHAIN_VERSION }}-armv7-unknown-linux-gnueabihf
+            popd
+
+            wget -O nasm.deb "http://ftp.us.debian.org/debian/pool/main/n/nasm/nasm_${{ env.SCITER_NASM_DEBVERSION }}_armhf.deb"
+            dpkg -i nasm.deb
+            rm -f nasm.deb
+
+          run: |
+            set -e
+            git config --global --add safe.directory '*'
+            update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.7 1
+            export PATH="/opt/cmake-${{ env.SCITER_ARMV7_CMAKE_VERSION }}-linux-armhf/bin:$PATH"
+            export VCPKG_FORCE_SYSTEM_BINARIES=1
+            export VCPKG_ROOT=/opt/artifacts/vcpkg
+            export USE_AOM_391=1
+
+            mkdir -p ~/.cargo
+            cat > ~/.cargo/config <<'EOF'
+            [source.crates-io]
+            registry = 'https://github.com/rust-lang/crates.io-index'
+            EOF
+
+            cd /workspace
+            sed -i 's/^set -euo pipefail$/set -eu/' scripts/apply-v4l2m2m-patch.sh
+            sed -i 's/^set -euo pipefail$/set -eu/' patches/apply-v4l2m2m-runtime-fix.sh
+            sed -i 's/^set -euo pipefail$/set -eu/' patches/apply-v4l2m2m-diagnostics.sh
+            sed -i 's/^set -euo pipefail$/set -eu/' rk3288/apply-armv7-v4l2-enable.sh
+
+            bash scripts/apply-v4l2m2m-patch.sh rustdesk
+            bash rk3288/apply-armv7-v4l2-enable.sh rustdesk
+            bash patches/apply-v4l2m2m-runtime-fix.sh rustdesk
+            bash patches/apply-v4l2m2m-diagnostics.sh rustdesk
+
+            cd /workspace/rustdesk
+            if ! "$VCPKG_ROOT/vcpkg" install --triplet arm-linux --x-install-root="$VCPKG_ROOT/installed"; then
+              find "$VCPKG_ROOT" -name '*.log' | while read -r f; do
+                echo "===== $f ====="
+                tail -n 200 "$f" || true
+              done
+              exit 1
+            fi
+
+            echo '===== FFmpeg V4L2M2M evidence ====='
+            grep -R -E 'enable-v4l2-m2m|h264_v4l2m2m|raising decoder OUTPUT' "$VCPKG_ROOT/buildtrees/ffmpeg" 2>/dev/null | head -80 || true
+
+            python3 ./res/inline-sciter.py
+            export CARGO_INCREMENTAL=0
+            cargo build --locked --features inline,hwcodec,unix-file-copy-paste --release --bins --jobs 1
+
+            mkdir -p ./Release
+            mv ./target/release/rustdesk ./Release/rustdesk
+            wget -O ./Release/libsciter-gtk.so https://github.com/c-smile/sciter-sdk/raw/master/bin.lnx/arm32/libsciter-gtk.so
+            export DEB_ARCH=armhf
+            ./build.py --package ./Release
+
+            src=$(ls -1 rustdesk*??.deb | head -n 1)
+            cp "$src" /workspace/rustdesk-1.4.9-v4l2m2m-rk3288-armhf.deb
+            ls -lh /workspace/rustdesk-1.4.9-v4l2m2m-rk3288-armhf.deb
+
+      - name: Upload RK3288 ARMv7 DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-1.4.9-v4l2m2m-rk3288-armhf
+          path: rustdesk-1.4.9-v4l2m2m-rk3288-armhf.deb
+          if-no-files-found: error
