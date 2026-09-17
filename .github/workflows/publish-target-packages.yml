@@ -18,6 +18,25 @@ jobs:
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-22.04
     steps:
+      - name: Wait for ARM64 Run 17
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RUN_ID=35201229130
+          for i in $(seq 1 120); do
+            status=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" --jq '.status')
+            conclusion=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" --jq '.conclusion // ""')
+            echo "ARM64 Run 17: status=$status conclusion=$conclusion"
+            if [ "$status" = "completed" ]; then
+              test "$conclusion" = "success"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo 'Timed out waiting for ARM64 Run 17'
+          exit 1
+
       - name: Download generic ARM64 package from Run 17
         uses: actions/download-artifact@v4
         with:
