@@ -4,13 +4,12 @@ set -euo pipefail
 RUSTDESK_DIR="${1:-rustdesk}"
 cd "$RUSTDESK_DIR"
 
-# Diagnostic build for Amlogic meson-vdec.
-# We intentionally do not change FFmpeg/V4L2 buffer sizing yet. The kernel
-# warning "esparser_pad_start_code: unable to pad start code" means the driver
-# could not fit its mandatory 4 KiB minimum padding + 512-byte search pattern
-# into the negotiated OUTPUT plane. First record the real RustDesk packet sizes
-# and decoder behaviour, then decide whether the correct fix belongs in FFmpeg
-# buffer negotiation or the kernel driver.
+# Diagnostic + runtime fix build for Amlogic meson-vdec.
+# RustDesk opens the V4L2M2M decoder before width/height are known, so FFmpeg
+# 7.1.1 requests a 128-byte compressed OUTPUT buffer. meson-vdec accepts that
+# value unchanged, and RustDesk's first Annex-B H.264/HEVC packets are much
+# larger. FFmpeg then truncates them to the mmap buffer length. Keep all of the
+# existing diagnostics, but enforce a 2 MiB minimum only for decoder OUTPUT.
 python3 - <<'PY'
 from pathlib import Path
 
@@ -91,10 +90,8 @@ s = s.replace(old, new, 1)
 p.write_text(s)
 PY
 
-# Inject diagnostics into FFmpeg 7.1.1 while vcpkg has SOURCE_PATH available.
-# This records both the sizeimage requested before VIDIOC_S_FMT and the value
-# returned by the driver, plus the actual mmap buffer length returned by
-# VIDIOC_QUERYBUF. We only observe values here; no buffer size is changed.
+# Inject FFmpeg 7.1.1 V4L2 diagnostics and the decoder OUTPUT buffer fix while
+# vcpkg has SOURCE_PATH available.
 python3 - <<'PY'
 from pathlib import Path
 p = Path('res/vcpkg/ffmpeg/portfile.cmake')
@@ -103,7 +100,7 @@ marker = '''if(SOURCE_PATH MATCHES " ")\n'''
 if 'V4L2DBG FFmpeg buffer negotiation diagnostics' not in s:
     if marker not in s:
         raise SystemExit('ffmpeg portfile insertion point not found')
-    block = r'''# V4L2DBG FFmpeg buffer negotiation diagnostics
+    block = r'''# V4L2DBG FFmpeg buffer negotiation diagnostics + 2 MiB decoder OUTPUT minimum
 file(READ "${SOURCE_PATH}/libavcodec/v4l2_context.c" _v4l2_context_src)
 set(_v4l2_context_old [=[int ff_v4l2_context_set_format(V4L2Context* ctx)
 {
@@ -112,16 +109,30 @@ set(_v4l2_context_old [=[int ff_v4l2_context_set_format(V4L2Context* ctx)
 ]=])
 set(_v4l2_context_new [=[int ff_v4l2_context_set_format(V4L2Context* ctx)
 {
+    AVCodecContext *avctx = logger(ctx);
     unsigned int req_width = v4l2_get_width(&ctx->format);
     unsigned int req_height = v4l2_get_height(&ctx->format);
     unsigned int req_sizeimage;
     unsigned int got_sizeimage;
+    const unsigned int min_decoder_output = 2U * 1024U * 1024U;
     int ret;
 
     if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type))
         req_sizeimage = ctx->format.fmt.pix_mp.plane_fmt[0].sizeimage;
     else
         req_sizeimage = ctx->format.fmt.pix.sizeimage;
+
+    if (V4L2_TYPE_IS_OUTPUT(ctx->type) && avctx &&
+        av_codec_is_decoder(avctx->codec) && req_sizeimage < min_decoder_output) {
+        av_log(logger(ctx), AV_LOG_WARNING,
+               "[V4L2DBG] raising decoder OUTPUT sizeimage %u -> %u\n",
+               req_sizeimage, min_decoder_output);
+        req_sizeimage = min_decoder_output;
+        if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type))
+            ctx->format.fmt.pix_mp.plane_fmt[0].sizeimage = req_sizeimage;
+        else
+            ctx->format.fmt.pix.sizeimage = req_sizeimage;
+    }
 
     av_log(logger(ctx), AV_LOG_WARNING,
            "[V4L2DBG] S_FMT before name=%s type=%u req=%ux%u sizeimage=%u\n",
@@ -186,5 +197,5 @@ grep -nE 'V4L2DBG|dbg_packets_|dbg_frames_|av_log_set_level' \
   hwcodec-local/cpp/ffmpeg_ram/ffmpeg_ram_decode.cpp | head -120 || true
 grep -nE 'V4L2DBG frame conversion failed|max_decode_fail_counter' \
   libs/scrap/src/common/codec.rs src/client.rs | head -80 || true
-grep -nE 'V4L2DBG FFmpeg|S_FMT before|QUERYBUF name' \
-  res/vcpkg/ffmpeg/portfile.cmake | head -80 || true
+grep -nE 'V4L2DBG FFmpeg|raising decoder OUTPUT|S_FMT before|QUERYBUF name' \
+  res/vcpkg/ffmpeg/portfile.cmake | head -100 || true
