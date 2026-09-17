@@ -110,6 +110,9 @@ jobs:
       - name: Apply V4L2M2M diagnostics
         run: bash patches/apply-v4l2m2m-diagnostics.sh rustdesk
 
+      - name: Default Linux texture renderer off
+        run: bash patches/apply-linux-texture-default-off.sh rustdesk
+
       - name: Restore bridge
         uses: actions/download-artifact@v4
         with:
