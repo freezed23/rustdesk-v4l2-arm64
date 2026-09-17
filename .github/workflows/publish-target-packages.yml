@@ -1,0 +1,74 @@
+name: Publish RustDesk target packages
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - Build RustDesk 1.4.9 RK3288 ARMv7 V4L2M2M
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download generic ARM64 package from Run 17
+        uses: actions/download-artifact@v4
+        with:
+          repository: ${{ github.repository }}
+          run-id: 35201229130
+          name: rustdesk-1.4.9-v4l2m2m-aarch64
+          path: release/arm64
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download Raspberry Pi 3 package from Run 17
+        uses: actions/download-artifact@v4
+        with:
+          repository: ${{ github.repository }}
+          run-id: 35201229130
+          name: rustdesk-1.4.9-v4l2m2m-rpi3-arm64
+          path: release/rpi3
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download Raspberry Pi 4 package from Run 17
+        uses: actions/download-artifact@v4
+        with:
+          repository: ${{ github.repository }}
+          run-id: 35201229130
+          name: rustdesk-1.4.9-v4l2m2m-rpi4-arm64
+          path: release/rpi4
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download RK3288 ARMv7 package
+        uses: actions/download-artifact@v4
+        with:
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || 35201642189 }}
+          name: rustdesk-1.4.9-v4l2m2m-rk3288-armhf
+          path: release/rk3288
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify packages
+        run: |
+          set -euxo pipefail
+          find release -type f -name '*.deb' -print -exec ls -lh {} \;
+          test "$(find release -type f -name '*.deb' | wc -l)" -eq 4
+          find release -type f -name '*.deb' -exec dpkg-deb --info {} \; >/dev/null
+          find release -type f -name '*.deb' -exec sha256sum {} \;
+
+      - name: Publish all packages to stable V4L2M2M release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          TAG='v1.4.9-v4l2m2m'
+          mapfile -t DEBS < <(find release -type f -name '*.deb' | sort)
+          test "${#DEBS[@]}" -eq 4
+          gh release upload "$TAG" "${DEBS[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,tagName,name,assets
