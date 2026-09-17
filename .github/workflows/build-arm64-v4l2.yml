@@ -234,9 +234,32 @@ jobs:
 
           ls -lh *.deb
 
+      - name: Prepare Raspberry Pi 3 and Pi 4 package aliases
+        working-directory: rustdesk
+        run: |
+          src="$(ls -1 *v4l2m2m-aarch64.deb | head -n 1)"
+          prefix="${src%-v4l2m2m-aarch64.deb}"
+          cp -f "$src" "${prefix}-v4l2m2m-rpi3-arm64.deb"
+          cp -f "$src" "${prefix}-v4l2m2m-rpi4-arm64.deb"
+          ls -lh "${prefix}-v4l2m2m-rpi3-arm64.deb" "${prefix}-v4l2m2m-rpi4-arm64.deb"
+
       - name: Upload ARM64 DEB
         uses: actions/upload-artifact@v4
         with:
           name: rustdesk-1.4.9-v4l2m2m-aarch64
           path: rustdesk/*v4l2m2m-aarch64.deb
+          if-no-files-found: error
+
+      - name: Upload Raspberry Pi 3 ARM64 DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-1.4.9-v4l2m2m-rpi3-arm64
+          path: rustdesk/*v4l2m2m-rpi3-arm64.deb
+          if-no-files-found: error
+
+      - name: Upload Raspberry Pi 4 ARM64 DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-1.4.9-v4l2m2m-rpi4-arm64
+          path: rustdesk/*v4l2m2m-rpi4-arm64.deb
           if-no-files-found: error
