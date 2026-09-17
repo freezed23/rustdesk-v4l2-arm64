@@ -22,7 +22,7 @@ jobs:
           name: rustdesk-1.4.9-v4l2m2m-aarch64
           path: release
           repository: ${{ github.repository }}
-          run-id: 35182250478
+          run-id: 35188098327
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify DEB
@@ -35,27 +35,23 @@ jobs:
           dpkg-deb --info "$DEB" | head -40
           sha256sum "$DEB"
 
-      - name: Create GitHub Release and upload DEB
+      - name: Create GitHub Release or replace DEB asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euxo pipefail
           TAG='v1.4.9-v4l2m2m'
-          TARGET='29c7993480b3931457e3bb4f0b0448de88275951'
+          TARGET='17bc2e6ffbc5ea427ed56d01675cf875bf893f7c'
           DEB="$(find release -type f -name '*.deb' -print -quit)"
 
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" "$DEB" --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --target "$TARGET" \
-              --title 'RustDesk 1.4.9 ARM64 V4L2M2M Diagnostics' \
-              --notes 'Run #13 diagnostic build. Includes RustDesk/hwcodec V4L2M2M diagnostics plus FFmpeg 7.1.1 V4L2 S_FMT requested/returned sizeimage and QUERYBUF actual buffer length logging.'
           else
             gh release create "$TAG" "$DEB" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$TARGET" \
-              --title 'RustDesk 1.4.9 ARM64 V4L2M2M Diagnostics' \
-              --notes 'Run #13 diagnostic build. Includes RustDesk/hwcodec V4L2M2M diagnostics plus FFmpeg 7.1.1 V4L2 S_FMT requested/returned sizeimage and QUERYBUF actual buffer length logging.'
+              --title 'RustDesk 1.4.9 ARM64 V4L2M2M' \
+              --notes 'Run #14 build. Adds a 2 MiB minimum FFmpeg V4L2M2M decoder OUTPUT buffer while retaining V4L2 diagnostics.'
           fi
 
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,tagName,name,assets
