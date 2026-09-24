@@ -1053,3 +1053,418 @@ grep -nF "rustdesk/mediacodec_surface" "$MAIN_ACTIVITY" "$REMOTE_PAGE"
 grep -nF "Export MediaCodec debug log" "$SETTINGS_PAGE"
 grep -nF "on_surface_frame" "$UI_TRAIT" "$FLUTTER_RS" "$IO_LOOP"
 grep -nF "surface_frame" "$MODEL_DART"
+
+
+# Surface lifecycle v3: wait for the real ANativeWindow before session decoder
+# creation, rebind MediaCodec when a late/new Surface appears, and stop the old
+# MediaCodec before codec switches so Qualcomm/Amlogic resources are released.
+CLIENT_RS="$ROOT/src/client.rs"
+
+python3 - "$MC" "$CODEC" "$SURFACE_KT" "$CLIENT_RS" <<'PY3'
+from pathlib import Path
+import sys
+
+mc_p, codec_p, surface_p, client_p = map(Path, sys.argv[1:])
+
+s = mc_p.read_text()
+
+old = '''        atomic::{AtomicBool, Ordering},
+        Mutex, Once,''';
+new = '''        atomic::{AtomicBool, AtomicU64, Ordering},
+        Mutex, Once,''';
+if old not in s:
+    raise SystemExit("v3 atomic import target not found")
+s = s.replace(old, new, 1)
+
+old = '''static PROBE_ONCE: Once = Once::new();
+
+lazy_static::lazy_static! {''';
+new = '''static PROBE_ONCE: Once = Once::new();
+static SURFACE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+lazy_static::lazy_static! {''';
+if old not in s:
+    raise SystemExit("v3 surface generation insertion target not found")
+s = s.replace(old, new, 1)
+
+old = '''pub fn set_output_surface(env: *mut jni::sys::JNIEnv, surface: jni::sys::jobject) {
+    if surface.is_null() {
+        *OUTPUT_SURFACE.lock().unwrap() = None;
+        diag("surface detached");
+        return;
+    }
+
+    let window = unsafe { NativeWindow::from_surface(env as *mut _, surface as _) };
+    match window {
+        Some(window) => {
+            let width = window.width();
+            let height = window.height();
+            *OUTPUT_SURFACE.lock().unwrap() = Some(window);
+            diag(format!("surface attached {}x{}", width, height));
+        }
+        None => {
+            diag("ANativeWindow_fromSurface failed");
+        }
+    }
+}
+
+pub fn has_output_surface() -> bool {
+    OUTPUT_SURFACE.lock().unwrap().is_some()
+}
+
+fn current_output_surface() -> Option<NativeWindow> {
+    OUTPUT_SURFACE.lock().unwrap().as_ref().cloned()
+}''';
+new = '''pub fn set_output_surface(env: *mut jni::sys::JNIEnv, surface: jni::sys::jobject) {
+    if surface.is_null() {
+        *OUTPUT_SURFACE.lock().unwrap() = None;
+        let generation = SURFACE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        diag(format!("surface detached generation={}", generation));
+        return;
+    }
+
+    let window = unsafe { NativeWindow::from_surface(env as *mut _, surface as _) };
+    match window {
+        Some(window) => {
+            let width = window.width();
+            let height = window.height();
+            *OUTPUT_SURFACE.lock().unwrap() = Some(window);
+            let generation = SURFACE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+            diag(format!(
+                "surface attached {}x{} generation={}",
+                width, height, generation
+            ));
+        }
+        None => {
+            diag("ANativeWindow_fromSurface failed");
+        }
+    }
+}
+
+pub fn has_output_surface() -> bool {
+    OUTPUT_SURFACE.lock().unwrap().is_some()
+}
+
+pub fn output_surface_generation() -> u64 {
+    SURFACE_GENERATION.load(Ordering::SeqCst)
+}
+
+fn current_output_surface() -> Option<NativeWindow> {
+    OUTPUT_SURFACE.lock().unwrap().as_ref().cloned()
+}
+
+fn wait_for_output_surface(timeout: Duration) -> Option<NativeWindow> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(surface) = current_output_surface() {
+            if start.elapsed() > Duration::from_millis(1) {
+                diag(format!(
+                    "waited {}ms for output surface generation={}",
+                    start.elapsed().as_millis(),
+                    output_surface_generation()
+                ));
+            }
+            return Some(surface);
+        }
+        if start.elapsed() >= timeout {
+            diag(format!(
+                "surface wait timeout after {}ms; using ByteBuffer fallback",
+                timeout.as_millis()
+            ));
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}''';
+if old not in s:
+    raise SystemExit("v3 set_output_surface target not found")
+s = s.replace(old, new, 1)
+
+old = '''pub struct MediaCodecDecoder {
+    decoder: MediaCodec,
+    name: String,
+    surface_mode: bool,
+    queued_frames: u64,
+    rendered_frames: u64,
+    no_output_count: u64,
+}''';
+new = '''pub struct MediaCodecDecoder {
+    decoder: MediaCodec,
+    name: String,
+    format: CodecFormat,
+    surface_mode: bool,
+    surface_generation: u64,
+    queued_frames: u64,
+    rendered_frames: u64,
+    no_output_count: u64,
+}''';
+if old not in s:
+    raise SystemExit("v3 MediaCodecDecoder struct target not found")
+s = s.replace(old, new, 1)
+
+old = '''    pub fn new(format: CodecFormat) -> Option<MediaCodecDecoder> {
+        match format {
+            CodecFormat::H264 => create_media_codec(H264_MIME_TYPE, MediaCodecDirection::Decoder),
+            CodecFormat::H265 => create_media_codec(H265_MIME_TYPE, MediaCodecDirection::Decoder),
+            _ => {
+                diag(format!("unsupported codec format: {:?}", format));
+                None
+            }
+        }
+    }''';
+new = '''    pub fn new(format: CodecFormat) -> Option<MediaCodecDecoder> {
+        create_media_codec_for_format(format, true, false)
+    }''';
+if old not in s:
+    raise SystemExit("v3 MediaCodecDecoder::new target not found")
+s = s.replace(old, new, 1)
+
+old = '''    pub fn decode(&mut self, data: &[u8], rgb: &mut ImageRgb) -> ResultType<bool> {
+        self.queued_frames = self.queued_frames.saturating_add(1);
+
+        match self.dequeue_input_buffer(Duration::from_millis(20))? {''';
+new = '''    pub fn decode(&mut self, data: &[u8], rgb: &mut ImageRgb) -> ResultType<bool> {
+        let generation = output_surface_generation();
+        let surface_present = has_output_surface();
+
+        // If this decoder started before SurfaceView was ready, or SurfaceView
+        // was destroyed/recreated, bind a fresh MediaCodec to the current
+        // ANativeWindow. Stop the old codec first: some vendor codecs reject a
+        // second surface decoder while the previous instance is still active.
+        if surface_present && self.surface_generation != generation {
+            let format = self.format.clone();
+            diag(format!(
+                "surface generation changed codec={} old={} new={} mode={}; rebinding",
+                self.name, self.surface_generation, generation, self.surface_mode
+            ));
+            let _ = self.decoder.stop();
+
+            if let Some(replacement) = create_media_codec_for_format(format.clone(), false, false) {
+                let rebound_surface = replacement.surface_mode;
+                *self = replacement;
+                diag(format!(
+                    "decoder rebound format={:?} surface={} generation={}",
+                    format, rebound_surface, self.surface_generation
+                ));
+            } else if let Some(replacement) =
+                create_media_codec_for_format(format.clone(), false, true)
+            {
+                *self = replacement;
+                diag(format!(
+                    "surface rebind failed; ByteBuffer fallback format={:?} generation={}",
+                    format, self.surface_generation
+                ));
+            } else {
+                bail!("failed to recreate MediaCodec after Surface change");
+            }
+        }
+
+        if self.surface_mode && !surface_present {
+            // SurfaceView can disappear briefly during Android view/layout
+            // transitions. Do not feed frames into a decoder bound to a dead
+            // ANativeWindow; a new generation will rebind it when Surface returns.
+            return Ok(true);
+        }
+
+        self.queued_frames = self.queued_frames.saturating_add(1);
+
+        match self.dequeue_input_buffer(Duration::from_millis(20))? {''';
+if old not in s:
+    raise SystemExit("v3 decode preamble target not found")
+s = s.replace(old, new, 1)
+
+old = '''fn create_media_codec(mime: &str, direction: MediaCodecDirection) -> Option<MediaCodecDecoder> {
+    let surface = current_output_surface();
+    let surface_mode = surface.is_some();
+    let preferred = preferred_decoder_name(mime, surface_mode);
+
+    let decoder = preferred
+        .as_deref()
+        .and_then(MediaCodec::from_codec_name)
+        .or_else(|| MediaCodec::from_decoder_type(mime))?;
+
+    let selected_name = preferred.unwrap_or_else(|| format!("auto:{}", mime));
+    let media_format = MediaFormat::new();
+    media_format.set_str("mime", mime);
+    media_format.set_i32("width", 1920);
+    media_format.set_i32("height", 1080);
+    media_format.set_i32("max-input-size", MAX_INPUT_SIZE);
+    if !surface_mode {
+        media_format.set_i32("color-format", COLOR_FORMAT_YUV420_PLANAR);
+    }
+
+    if let Err(e) = decoder.configure(&media_format, surface.as_ref(), direction) {
+        diag(format!(
+            "configure failed codec={} mime={} surface={} err={:?}",
+            selected_name, mime, surface_mode, e
+        ));
+        return None;
+    }
+    if let Err(e) = decoder.start() {
+        diag(format!(
+            "start failed codec={} mime={} surface={} err={:?}",
+            selected_name, mime, surface_mode, e
+        ));
+        return None;
+    }
+
+    diag(format!(
+        "decoder started codec={} mime={} surface={} input_max={}",
+        selected_name, mime, surface_mode, MAX_INPUT_SIZE
+    ));
+    Some(MediaCodecDecoder {
+        decoder,
+        name: selected_name,
+        surface_mode,
+        queued_frames: 0,
+        rendered_frames: 0,
+        no_output_count: 0,
+    })
+}''';
+new = '''fn create_media_codec_for_format(
+    format: CodecFormat,
+    wait_for_surface: bool,
+    force_bytebuffer: bool,
+) -> Option<MediaCodecDecoder> {
+    let mime = match format {
+        CodecFormat::H264 => H264_MIME_TYPE,
+        CodecFormat::H265 => H265_MIME_TYPE,
+        _ => {
+            diag(format!("unsupported codec format: {:?}", format));
+            return None;
+        }
+    };
+
+    let surface = if force_bytebuffer {
+        None
+    } else if wait_for_surface {
+        wait_for_output_surface(Duration::from_millis(1500))
+    } else {
+        current_output_surface()
+    };
+    let surface_mode = surface.is_some();
+    let generation = output_surface_generation();
+    let preferred = preferred_decoder_name(mime, surface_mode);
+
+    let decoder = preferred
+        .as_deref()
+        .and_then(MediaCodec::from_codec_name)
+        .or_else(|| MediaCodec::from_decoder_type(mime))?;
+
+    let selected_name = preferred.unwrap_or_else(|| format!("auto:{}", mime));
+    let media_format = MediaFormat::new();
+    media_format.set_str("mime", mime);
+    media_format.set_i32("width", 1920);
+    media_format.set_i32("height", 1080);
+    media_format.set_i32("max-input-size", MAX_INPUT_SIZE);
+    if !surface_mode {
+        media_format.set_i32("color-format", COLOR_FORMAT_YUV420_PLANAR);
+    }
+
+    if let Err(e) = decoder.configure(&media_format, surface.as_ref(), MediaCodecDirection::Decoder) {
+        diag(format!(
+            "configure failed codec={} mime={} surface={} generation={} err={:?}",
+            selected_name, mime, surface_mode, generation, e
+        ));
+        return None;
+    }
+    if let Err(e) = decoder.start() {
+        diag(format!(
+            "start failed codec={} mime={} surface={} generation={} err={:?}",
+            selected_name, mime, surface_mode, generation, e
+        ));
+        return None;
+    }
+
+    diag(format!(
+        "decoder started codec={} mime={} surface={} generation={} input_max={}",
+        selected_name, mime, surface_mode, generation, MAX_INPUT_SIZE
+    ));
+    Some(MediaCodecDecoder {
+        decoder,
+        name: selected_name,
+        format,
+        surface_mode,
+        surface_generation: generation,
+        queued_frames: 0,
+        rendered_frames: 0,
+        no_output_count: 0,
+    })
+}''';
+if old not in s:
+    raise SystemExit("v3 create_media_codec target not found")
+s = s.replace(old, new, 1)
+
+old = '''            let h264 = MediaCodecDecoder::new(CodecFormat::H264);
+            let h265 = MediaCodecDecoder::new(CodecFormat::H265);''';
+new = '''            // Startup capability probing must never wait for a remote-session
+            // SurfaceView. The actual session decoder waits/rebinds separately.
+            let h264 = create_media_codec_for_format(CodecFormat::H264, false, true);
+            let h265 = create_media_codec_for_format(CodecFormat::H265, false, true);''';
+if old not in s:
+    raise SystemExit("v3 startup probe target not found")
+s = s.replace(old, new, 1)
+
+mc_p.write_text(s)
+
+# Expose an explicit MediaCodec stop so codec switches free the old vendor
+# decoder before configuring the replacement.
+s = codec_p.read_text()
+anchor = '''    pub fn valid(&self) -> bool {
+        self.valid
+    }
+''';
+extra = '''
+    #[cfg(feature = "mediacodec")]
+    pub fn stop_mediacodec(&mut self) {
+        if let Some(decoder) = &mut self.h264_media_codec {
+            let _ = decoder.stop();
+        }
+        if let Some(decoder) = &mut self.h265_media_codec {
+            let _ = decoder.stop();
+        }
+    }
+''';
+if anchor not in s:
+    raise SystemExit("v3 Decoder::valid anchor not found")
+s = s.replace(anchor, anchor + extra, 1)
+codec_p.write_text(s)
+
+s = client_p.read_text()
+old = '''        let luid = Self::get_adapter_luid();
+        let format = format.unwrap_or(self.decoder.format());
+        self.decoder = Decoder::new(format, luid);''';
+new = '''        let luid = Self::get_adapter_luid();
+        let format = format.unwrap_or(self.decoder.format());
+        #[cfg(feature = "mediacodec")]
+        self.decoder.stop_mediacodec();
+        self.decoder = Decoder::new(format, luid);''';
+if old not in s:
+    raise SystemExit("v3 VideoHandler::reset target not found")
+s = s.replace(old, new, 1)
+client_p.write_text(s)
+
+# surfaceChanged is geometry-only. Re-sending the same Java Surface to Rust on
+# every layout change creates artificial generations and needless decoder resets.
+s = surface_p.read_text()
+old = '''    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        FFI.setMediaCodecSurface(holder.surface)
+        MediaCodecSurfaceState.onReady()
+        Log.i("RustDeskMC", "MediaCodec Surface changed " + width + "x" + height)
+    }''';
+new = '''    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        MediaCodecSurfaceState.onReady()
+        Log.i("RustDeskMC", "MediaCodec Surface geometry " + width + "x" + height)
+    }''';
+if old not in s:
+    raise SystemExit("v3 surfaceChanged target not found")
+s = s.replace(old, new, 1)
+surface_p.write_text(s)
+
+print("Applied Android MediaCodec Surface lifecycle patch v3")
+PY3
+
+grep -nF "surface generation changed" "$MC"
+grep -nF "wait_for_output_surface" "$MC"
+grep -nF "stop_mediacodec" "$CODEC" "$CLIENT_RS"
+grep -nF "Surface geometry" "$SURFACE_KT"
