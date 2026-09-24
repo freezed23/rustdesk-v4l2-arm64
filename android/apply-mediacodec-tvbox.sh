@@ -37,7 +37,9 @@ if old_fmt not in s:
     raise SystemExit("required MediaCodec format-log patch target not found")
 s = s.replace(old_fmt, new_fmt, 1)
 
-old_stride = '        // take dst_stride into account please\\n        let dst_stride = rgb.stride();\\n'
+old_stride = '''        // take dst_stride into account please
+        let dst_stride = rgb.stride();
+'''
 if old_stride not in s:
     raise SystemExit("required obsolete rgb.stride() patch target not found")
 s = s.replace(old_stride, '', 1)
