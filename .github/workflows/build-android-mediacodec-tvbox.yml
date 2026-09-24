@@ -149,26 +149,38 @@ jobs:
           sed -i 's/signingConfigs.release/signingConfigs.debug/g' \
             rustdesk/flutter/android/app/build.gradle
 
+          # Side-by-side test package: keep official RustDesk installed on the same device.
+          sed -i 's/applicationId "com.carriez.flutter_hbb"/applicationId "com.carriez.flutter_hbb.mediacodec"/' \
+            rustdesk/flutter/android/app/build.gradle
+          sed -i 's/android:label="RustDesk"/android:label="RustDesk MC Test"/' \
+            rustdesk/flutter/android/app/src/main/AndroidManifest.xml
+          grep -F 'applicationId "com.carriez.flutter_hbb.mediacodec"' \
+            rustdesk/flutter/android/app/build.gradle
+          grep -F 'android:label="RustDesk MC Test"' \
+            rustdesk/flutter/android/app/src/main/AndroidManifest.xml
+
           pushd rustdesk/flutter
           flutter build apk --release --target-platform android-arm64 --split-per-abi
           popd
 
           cp rustdesk/flutter/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
-            rustdesk-1.4.9-android-tvbox-mediacodec-arm64.apk
+            rustdesk-1.4.9-android-mediacodec-sidebyside-arm64.apk
 
           # CI sanity checks: correct ABI library and manifest/package must be present.
-          unzip -l rustdesk-1.4.9-android-tvbox-mediacodec-arm64.apk | \
+          unzip -l rustdesk-1.4.9-android-mediacodec-sidebyside-arm64.apk | \
             grep -F 'lib/arm64-v8a/librustdesk.so'
           AAPT=$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -type f -name aapt | sort -V | tail -n1)
           test -n "$AAPT"
-          "$AAPT" dump badging rustdesk-1.4.9-android-tvbox-mediacodec-arm64.apk | head -n 20
+          "$AAPT" dump badging rustdesk-1.4.9-android-mediacodec-sidebyside-arm64.apk | head -n 20
+          "$AAPT" dump badging rustdesk-1.4.9-android-mediacodec-sidebyside-arm64.apk | \
+            grep -F "package: name='com.carriez.flutter_hbb.mediacodec'"
 
-          sha256sum rustdesk-1.4.9-android-tvbox-mediacodec-arm64.apk
-          ls -lh rustdesk-1.4.9-android-tvbox-mediacodec-arm64.apk
+          sha256sum rustdesk-1.4.9-android-mediacodec-sidebyside-arm64.apk
+          ls -lh rustdesk-1.4.9-android-mediacodec-sidebyside-arm64.apk
 
       - name: Upload Android TV-box APK
         uses: actions/upload-artifact@v4
         with:
-          name: rustdesk-1.4.9-android-tvbox-mediacodec-arm64
-          path: rustdesk-1.4.9-android-tvbox-mediacodec-arm64.apk
+          name: rustdesk-1.4.9-android-mediacodec-sidebyside-arm64
+          path: rustdesk-1.4.9-android-mediacodec-sidebyside-arm64.apk
           if-no-files-found: error
