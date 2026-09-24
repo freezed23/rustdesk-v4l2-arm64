@@ -1,0 +1,65 @@
+name: Publish RustDesk Android TV MediaCodec
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - Build RustDesk Android TV MediaCodec ARM64
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Resolve source run
+        id: src
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "run_id=${{ github.event.workflow_run.id }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_id=35959652994" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download Android TV-box artifact
+        uses: actions/download-artifact@v4
+        with:
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.src.outputs.run_id }}
+          name: rustdesk-1.4.9-android-tvbox-mediacodec-arm64
+          path: release
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f release/rustdesk-1.4.9-android-tvbox-mediacodec-arm64.apk
+          ls -lh release/rustdesk-1.4.9-android-tvbox-mediacodec-arm64.apk
+          sha256sum release/rustdesk-1.4.9-android-tvbox-mediacodec-arm64.apk
+
+      - name: Publish Android TV-box release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TAG='v1.4.9-android-tvbox-mediacodec'
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "RustDesk 1.4.9 Android TV MediaCodec" \
+              --notes "Experimental ARM64 Android TV-box build for M8S/X92 MediaCodec validation."
+          fi
+          gh release upload "$TAG" \
+            release/rustdesk-1.4.9-android-tvbox-mediacodec-arm64.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,tagName,name,assets
