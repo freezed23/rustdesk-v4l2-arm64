@@ -1,4 +1,5 @@
 name: Build RustDesk Android TV MediaCodec ARM64
+# rebuild-trigger: 2
 
 on:
   workflow_dispatch:
