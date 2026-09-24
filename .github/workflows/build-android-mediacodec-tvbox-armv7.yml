@@ -1,0 +1,189 @@
+name: Build RustDesk Android TV MediaCodec ARMv7
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-android-mediacodec-tvbox-armv7.yml'
+      - 'android/**'
+
+env:
+  RUSTDESK_COMMIT: 6c578292e
+  RUST_VERSION: '1.75'
+  FLUTTER_VERSION: '3.24.5'
+  CARGO_NDK_VERSION: '3.1.2'
+  NDK_VERSION: 'r28c'
+  VCPKG_COMMIT_ID: 120deac3062162151622ca4860575a33844ba10b
+  VCPKG_BINARY_SOURCES: clear;x-gha,readwrite
+
+jobs:
+  build-android-tvbox-armv7:
+    name: Android armeabi-v7a MediaCodec TV-box APK
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout helper repo
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang cmake curl gcc-multilib git g++ g++-multilib \
+            libayatana-appindicator3-dev libasound2-dev libc6-dev \
+            libclang-dev libunwind-dev libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev libgtk-3-dev libpam0g-dev \
+            libpulse-dev libva-dev libxcb-randr0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxdo-dev libxfixes-dev llvm-dev nasm \
+            ninja-build openjdk-17-jdk-headless pkg-config tree wget
+
+      - name: Checkout RustDesk 1.4.9
+        run: |
+          git clone --recursive https://github.com/rustdesk/rustdesk.git rustdesk
+          cd rustdesk
+          git checkout "$RUSTDESK_COMMIT"
+          git submodule update --init --recursive --force
+
+      - name: Install Rust 1.75
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: armv7-linux-androideabi
+          components: rustfmt
+
+      - name: Install Flutter 3.24.5
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Patch Flutter
+        run: |
+          set -euo pipefail
+          cd "$(dirname "$(dirname "$(which flutter)")")"
+          PATCH="$GITHUB_WORKSPACE/rustdesk/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+          if git apply --check "$PATCH"; then
+            git apply "$PATCH"
+            echo "Flutter dropdown patch applied"
+          elif git apply --reverse --check "$PATCH"; then
+            echo "Flutter dropdown patch already applied in cached SDK"
+          else
+            echo "ERROR: Flutter dropdown patch neither applies nor is already applied" >&2
+            exit 1
+          fi
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Generate Flutter bridge
+        working-directory: rustdesk
+        run: |
+          cargo install cargo-expand --version 1.0.95 --locked
+          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          pushd flutter
+          flutter pub get
+          popd
+          ~/.cargo/bin/flutter_rust_bridge_codegen \
+            --rust-input ./src/flutter_ffi.rs \
+            --dart-output ./flutter/lib/generated_bridge.dart \
+            --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+          git checkout -- flutter/pubspec.yaml flutter/pubspec.lock
+          pushd flutter
+          flutter pub get
+          grep -A7 '^  extended_text:' pubspec.lock | grep 'version: "14.0.0"'
+          popd
+
+      - name: Apply Android MediaCodec TV-box patch
+        run: bash android/apply-mediacodec-tvbox.sh rustdesk
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install Android armeabi-v7a dependencies
+        working-directory: rustdesk
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          ./flutter/build_android_deps.sh armeabi-v7a
+
+      - name: Build RustDesk armeabi-v7a library
+        working-directory: rustdesk
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo install cargo-ndk --version "$CARGO_NDK_VERSION" --locked
+          ./flutter/ndk_arm.sh
+          ls -lh target/armv7-linux-androideabi/release/liblibrustdesk.so
+
+      - name: Build APK
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+        run: |
+          mkdir -p rustdesk/flutter/android/app/src/main/jniLibs/armeabi-v7a
+          cp rustdesk/target/armv7-linux-androideabi/release/liblibrustdesk.so \
+            rustdesk/flutter/android/app/src/main/jniLibs/armeabi-v7a/librustdesk.so
+          cp "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/libc++_shared.so" \
+            rustdesk/flutter/android/app/src/main/jniLibs/armeabi-v7a/
+
+          sed -i 's/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g' \
+            rustdesk/flutter/android/gradle.properties
+          sed -i 's/signingConfigs.release/signingConfigs.debug/g' \
+            rustdesk/flutter/android/app/build.gradle
+
+          sed -i 's/applicationId "com.carriez.flutter_hbb"/applicationId "com.carriez.flutter_hbb.mediacodec"/' \
+            rustdesk/flutter/android/app/build.gradle
+          sed -i 's/android:label="RustDesk"/android:label="RustDesk MC Test"/' \
+            rustdesk/flutter/android/app/src/main/AndroidManifest.xml
+
+          pushd rustdesk/flutter
+          flutter build apk --release --target-platform android-arm --split-per-abi
+          popd
+
+          cp rustdesk/flutter/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk \
+            rustdesk-1.4.9-android-mediacodec-sidebyside-armeabi-v7a.apk
+
+          unzip -l rustdesk-1.4.9-android-mediacodec-sidebyside-armeabi-v7a.apk | \
+            grep -F 'lib/armeabi-v7a/librustdesk.so'
+          AAPT=$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -type f -name aapt | sort -V | tail -n1)
+          test -n "$AAPT"
+          "$AAPT" dump badging rustdesk-1.4.9-android-mediacodec-sidebyside-armeabi-v7a.apk | head -n 20
+          "$AAPT" dump badging rustdesk-1.4.9-android-mediacodec-sidebyside-armeabi-v7a.apk | \
+            grep -F "package: name='com.carriez.flutter_hbb.mediacodec'"
+          unzip -l rustdesk-1.4.9-android-mediacodec-sidebyside-armeabi-v7a.apk | \
+            grep -F 'lib/armeabi-v7a/libc++_shared.so'
+
+          sha256sum rustdesk-1.4.9-android-mediacodec-sidebyside-armeabi-v7a.apk
+          ls -lh rustdesk-1.4.9-android-mediacodec-sidebyside-armeabi-v7a.apk
+
+      - name: Upload Android armeabi-v7a APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-1.4.9-android-mediacodec-sidebyside-armeabi-v7a
+          path: rustdesk-1.4.9-android-mediacodec-sidebyside-armeabi-v7a.apk
+          if-no-files-found: error
