@@ -72,8 +72,18 @@ jobs:
 
       - name: Patch Flutter
         run: |
+          set -euo pipefail
           cd "$(dirname "$(dirname "$(which flutter)")")"
-          git apply "$GITHUB_WORKSPACE/rustdesk/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+          PATCH="$GITHUB_WORKSPACE/rustdesk/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+          if git apply --check "$PATCH"; then
+            git apply "$PATCH"
+            echo "Flutter dropdown patch applied"
+          elif git apply --reverse --check "$PATCH"; then
+            echo "Flutter dropdown patch already applied in cached SDK"
+          else
+            echo "ERROR: Flutter dropdown patch neither applies nor is already applied" >&2
+            exit 1
+          fi
 
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
