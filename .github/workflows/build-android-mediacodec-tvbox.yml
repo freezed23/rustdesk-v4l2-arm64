@@ -97,6 +97,14 @@ jobs:
             --c-output ./flutter/macos/Runner/bridge_generated.h
           cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
 
+          # extended_text 13 is only a temporary bridge-generation workaround.
+          # Restore RustDesk 1.4.9's real Flutter 3.24.5 dependency set before APK build.
+          git checkout -- flutter/pubspec.yaml flutter/pubspec.lock
+          pushd flutter
+          flutter pub get
+          grep -A7 '^  extended_text:' pubspec.lock | grep 'version: "14.0.0"'
+          popd
+
       - name: Apply Android MediaCodec TV-box patch
         run: bash android/apply-mediacodec-tvbox.sh rustdesk
 
@@ -147,6 +155,14 @@ jobs:
 
           cp rustdesk/flutter/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
             rustdesk-1.4.9-android-tvbox-mediacodec-arm64.apk
+
+          # CI sanity checks: correct ABI library and manifest/package must be present.
+          unzip -l rustdesk-1.4.9-android-tvbox-mediacodec-arm64.apk | \
+            grep -F 'lib/arm64-v8a/librustdesk.so'
+          AAPT=$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -type f -name aapt | sort -V | tail -n1)
+          test -n "$AAPT"
+          "$AAPT" dump badging rustdesk-1.4.9-android-tvbox-mediacodec-arm64.apk | head -n 20
+
           sha256sum rustdesk-1.4.9-android-tvbox-mediacodec-arm64.apk
           ls -lh rustdesk-1.4.9-android-tvbox-mediacodec-arm64.apk
 
