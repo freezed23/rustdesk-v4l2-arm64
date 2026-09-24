@@ -715,7 +715,8 @@ channel_new = '''                "try_sync_clipboard" -> {
                 }
                 "export_mc_log" -> {
                     try {
-                        result.success(MediaCodecLogExporter.export(this, FFI.getMediaCodecLog()))
+                        MediaCodecLogExporter.export(this, FFI.getMediaCodecLog())
+                        result.success(true)
                     } catch (e: Exception) {
                         Log.e(logTag, "MediaCodec log export failed", e)
                         result.error("MC_LOG_EXPORT", e.message, null)
@@ -956,8 +957,10 @@ hw_new = '''            SettingsTile.switchTile(
               description: const Text('Save to Download/RustDesk-MC'),
               onPressed: (context) async {
                 try {
-                  final path = await gFFI.invokeMethod("export_mc_log");
-                  showToast(path?.toString() ?? 'MediaCodec log exported');
+                  final ok = await gFFI.invokeMethod("export_mc_log");
+                  showToast(ok == true
+                      ? 'Saved to Download/RustDesk-MC'
+                      : 'MediaCodec log export failed');
                 } catch (e) {
                   showToast('MediaCodec log export failed: $e');
                 }
