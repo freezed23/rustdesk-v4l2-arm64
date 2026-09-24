@@ -29,6 +29,19 @@ codec.write_text(s)
 
 s = mc.read_text()
 
+# RustDesk 1.4.9 dormant MediaCodec code does not compile as-is.
+# Apply these as REQUIRED replacements and fail if upstream shape changed.
+old_fmt = 'log::error!("Unsupported codec format: {}", format);'
+new_fmt = 'log::error!("Unsupported codec format: {:?}", format);'
+if old_fmt not in s:
+    raise SystemExit("required MediaCodec format-log patch target not found")
+s = s.replace(old_fmt, new_fmt, 1)
+
+old_stride = '        // take dst_stride into account please\\n        let dst_stride = rgb.stride();\\n'
+if old_stride not in s:
+    raise SystemExit("required obsolete rgb.stride() patch target not found")
+s = s.replace(old_stride, '', 1)
+
 # Fix the obvious duplicated pixel-format branch.
 old = '''                        ImageFormat::ARGB => {
                             I420ToABGR('''
@@ -110,3 +123,9 @@ PY
 grep -n "features flutter" "$NDK"
 grep -n "h264_media_codec" "$CODEC" | head
 grep -n "ANDROID-MC" "$MC"
+grep -nF 'Unsupported codec format: {:?}' "$MC"
+grep -nF 'ImageFormat::ABGR' "$MC"
+if grep -nF 'let dst_stride = rgb.stride();' "$MC"; then
+  echo "ERROR: obsolete rgb.stride() line still present" >&2
+  exit 1
+fi
