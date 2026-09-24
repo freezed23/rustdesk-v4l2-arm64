@@ -4,17 +4,19 @@ set -euo pipefail
 ROOT="${1:-rustdesk}"
 CODEC="$ROOT/libs/scrap/src/common/codec.rs"
 MC="$ROOT/libs/scrap/src/common/mediacodec.rs"
-NDK="$ROOT/flutter/ndk_arm64.sh"
+NDK64="$ROOT/flutter/ndk_arm64.sh"
+NDK32="$ROOT/flutter/ndk_arm.sh"
 MANIFEST="$ROOT/flutter/android/app/src/main/AndroidManifest.xml"
 
-python3 - "$CODEC" "$MC" "$NDK" "$MANIFEST" <<'PY'
+python3 - "$CODEC" "$MC" "$NDK64" "$NDK32" "$MANIFEST" <<'PY'
 from pathlib import Path
 import sys
 
 codec = Path(sys.argv[1])
 mc = Path(sys.argv[2])
-ndk = Path(sys.argv[3])
-manifest = Path(sys.argv[4])
+ndk64 = Path(sys.argv[3])
+ndk32 = Path(sys.argv[4])
+manifest = Path(sys.argv[5])
 
 s = codec.read_text()
 s = s.replace(
@@ -104,12 +106,13 @@ if needle in s:
 
 mc.write_text(s)
 
-s = ndk.read_text()
-s = s.replace(
-    '--features flutter,hwcodec',
-    '--features flutter,mediacodec'
-)
-ndk.write_text(s)
+for ndk in (ndk64, ndk32):
+    s = ndk.read_text()
+    s = s.replace(
+        '--features flutter,hwcodec',
+        '--features flutter,mediacodec'
+    )
+    ndk.write_text(s)
 
 s = manifest.read_text()
 marker = '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n    package="com.carriez.flutter_hbb">'
@@ -122,7 +125,8 @@ manifest.write_text(s)
 print("Applied Android MediaCodec TV-box diagnostic patch")
 PY
 
-grep -n "features flutter" "$NDK"
+grep -n "features flutter" "$NDK64"
+grep -n "features flutter" "$NDK32"
 grep -n "h264_media_codec" "$CODEC" | head
 grep -n "ANDROID-MC" "$MC"
 grep -nF 'Unsupported codec format: {:?}' "$MC"
