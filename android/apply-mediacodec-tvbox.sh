@@ -2194,3 +2194,24 @@ print("Applied MediaCodec no-output borrow fix v10")
 PY10
 
 grep -nF "self.no_output_count = 0;" "$MC"
+
+
+# v8: PlatformViewHitTestBehavior is declared in flutter/rendering.dart and is
+# not exported by material.dart in this pinned Flutter version.
+python3 - "$REMOTE_PAGE" <<'PY8'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text()
+needle = "import 'package:flutter/material.dart';\n"
+insert = "import 'package:flutter/rendering.dart';\n"
+if insert not in s:
+    if needle not in s:
+        raise SystemExit("v8 material import target not found")
+    s = s.replace(needle, needle + insert, 1)
+p.write_text(s)
+print("Applied Android MediaCodec Flutter hit-test import patch v8")
+PY8
+
+grep -nF "package:flutter/rendering.dart" "$REMOTE_PAGE"
