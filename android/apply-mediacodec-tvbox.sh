@@ -1949,3 +1949,24 @@ PY7
 
 grep -nF "getExternalFilesDir" "$SURFACE_KT"
 grep -nF "without storage permission" "$SETTINGS_PAGE"
+
+
+# v8: PlatformViewHitTestBehavior lives in Flutter rendering and is not exported
+# by material.dart on Flutter 3.24.5.
+python3 - "$REMOTE_PAGE" <<'PY8'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text()
+imp = "import 'package:flutter/rendering.dart' show PlatformViewHitTestBehavior;\n"
+if imp not in s:
+    anchor = "import 'package:flutter/material.dart';\n"
+    if anchor not in s:
+        raise SystemExit("v8 material import anchor not found")
+    s = s.replace(anchor, anchor + imp, 1)
+p.write_text(s)
+print("Applied Android PlatformViewHitTestBehavior import fix v8")
+PY8
+
+grep -nF "PlatformViewHitTestBehavior" "$REMOTE_PAGE"
