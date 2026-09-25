@@ -1651,3 +1651,52 @@ PY4
 grep -nF "from_millis(8000)" "$MC"
 grep -nF "COLOR_FORMAT_YUV420_SEMIPLANAR" "$MC"
 grep -nF "ByteBuffer NV12 frame" "$MC"
+
+
+# v5: the ndk OutputBuffer borrows MediaCodec through Deref, so do not mutate
+# decoder counters until after release_output_buffer consumes the borrowed buffer.
+python3 - "$MC" <<'PY5'
+from pathlib import Path
+import sys
+
+mc_p = Path(sys.argv[1])
+s = mc_p.read_text()
+
+old = '''        let output = match self.dequeue_output_buffer(Duration::from_millis(20)) {'''
+new = '''        let log_bytebuffer_frame = self.rendered_frames < 5;
+        let output = match self.dequeue_output_buffer(Duration::from_millis(20)) {'''
+if old not in s:
+    raise SystemExit("v5 dequeue output target not found")
+s = s.replace(old, new, 1)
+
+old = '''                if self.rendered_frames < 5 {
+                    diag(format!(
+                        "ByteBuffer NV12 frame codec={} color=21 stride={} slice={} bytes={}",
+                        self.name, stride, slice, buf.len()
+                    ));
+                }
+                self.rendered_frames = self.rendered_frames.saturating_add(1);'''
+new = '''                if log_bytebuffer_frame {
+                    diag(format!(
+                        "ByteBuffer NV12 frame codec={} color=21 stride={} slice={} bytes={}",
+                        self.name, stride, slice, buf.len()
+                    ));
+                }'''
+if old not in s:
+    raise SystemExit("v5 NV12 counter target not found")
+s = s.replace(old, new, 1)
+
+old = '''        self.release_output_buffer(output_buffer, false)?;
+        Ok(true)'''
+new = '''        self.release_output_buffer(output_buffer, false)?;
+        self.rendered_frames = self.rendered_frames.saturating_add(1);
+        Ok(true)'''
+if old not in s:
+    raise SystemExit("v5 final release target not found")
+s = s.replace(old, new, 1)
+
+mc_p.write_text(s)
+print("Applied Android MediaCodec NV12 borrow fix v5")
+PY5
+
+grep -nF "log_bytebuffer_frame" "$MC"
