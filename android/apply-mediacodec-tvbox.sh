@@ -1970,3 +1970,178 @@ print("Applied Android PlatformViewHitTestBehavior import fix v8")
 PY8
 
 grep -nF "PlatformViewHitTestBehavior" "$REMOTE_PAGE"
+
+
+# v9: recover a Surface MediaCodec that keeps accepting input but produces no
+# output after monitor/surface changes. Also keep direct-Surface input mapping
+# usable without an RGBA frame and record mouse/touch events in the exported MC log.
+INPUT_MODEL="$ROOT/flutter/lib/models/input_model.dart"
+FLUTTER_FFI="$ROOT/src/flutter_ffi.rs"
+
+python3 - "$MC" "$INPUT_MODEL" "$FLUTTER_FFI" <<'PY9'
+from pathlib import Path
+import sys
+
+mc_p, input_p, ffi_p = map(Path, sys.argv[1:])
+
+# ---- MediaCodec consecutive no-output watchdog ----
+s = mc_p.read_text()
+
+anchor = '''pub fn diagnostic_log() -> String {
+    let mut out = MC_DIAG.lock().unwrap().join("\\n");
+    out.push_str(&format!(
+        "\\n[STATE] h264={} h265={} surface={}\\n",
+        H264_DECODER_SUPPORT.load(Ordering::SeqCst),
+        H265_DECODER_SUPPORT.load(Ordering::SeqCst),
+        has_output_surface()
+    ));
+    out
+}
+'''
+extra = '''
+pub fn diagnostic_note<S: AsRef<str>>(message: S) {
+    diag(message);
+}
+'''
+if anchor not in s:
+    raise SystemExit("v9 diagnostic_log anchor not found")
+s = s.replace(anchor, anchor + extra, 1)
+
+old = '''        let Some(output_buffer) = output else {
+            self.no_output_count = self.no_output_count.saturating_add(1);
+            if self.no_output_count <= 5 || self.no_output_count % 300 == 0 {
+                diag(format!(
+                    "input accepted, output pending codec={} count={}",
+                    self.name, self.no_output_count
+                ));
+            }
+            // MediaCodec decoding is asynchronous. No output yet is normal.
+            return Ok(true);
+        };
+
+        if self.surface_mode {'''
+new = '''        let Some(output_buffer) = output else {
+            self.no_output_count = self.no_output_count.saturating_add(1);
+            if self.no_output_count <= 5 || self.no_output_count % 90 == 0 {
+                diag(format!(
+                    "input accepted, output pending codec={} count={}",
+                    self.name, self.no_output_count
+                ));
+            }
+
+            // Amlogic OMX can enter a zombie state after a monitor/Surface
+            // transition: queueInputBuffer keeps succeeding forever, but no
+            // output buffer is ever produced. Treat 90 consecutive no-output
+            // dequeues as a stalled decoder and recreate it on the live Surface.
+            if self.surface_mode && self.no_output_count >= 90 && has_output_surface() {
+                let format = self.format.clone();
+                let generation = output_surface_generation();
+                diag(format!(
+                    "surface decoder stalled codec={} pending={} queued={} generation={}; recreating",
+                    self.name, self.no_output_count, self.queued_frames, generation
+                ));
+
+                if let Some(old_decoder) = self.decoder.take() {
+                    let _ = old_decoder.stop();
+                    drop(old_decoder);
+                }
+                std::thread::sleep(Duration::from_millis(150));
+
+                if let Some(replacement) =
+                    create_media_codec_for_format(format.clone(), false, false)
+                {
+                    *self = replacement;
+                    diag(format!(
+                        "surface stall recovered format={:?} surface={} generation={}",
+                        format, self.surface_mode, self.surface_generation
+                    ));
+                } else if let Some(replacement) =
+                    create_media_codec_for_format(format.clone(), false, true)
+                {
+                    *self = replacement;
+                    diag(format!(
+                        "surface stall recovery fell back to ByteBuffer format={:?} generation={}",
+                        format, self.surface_generation
+                    ));
+                } else {
+                    diag(format!(
+                        "surface stall recovery failed format={:?} generation={}",
+                        format, generation
+                    ));
+                    bail!("failed to recover stalled MediaCodec");
+                }
+            }
+
+            // MediaCodec decoding is asynchronous. No output yet is normal until
+            // the consecutive-stall threshold above is reached.
+            return Ok(true);
+        };
+
+        // no_output_count is consecutive, not cumulative.
+        self.no_output_count = 0;
+
+        if self.surface_mode {'''
+if old not in s:
+    raise SystemExit("v9 MediaCodec no-output block not found")
+s = s.replace(old, new, 1)
+mc_p.write_text(s)
+
+# ---- Direct-Surface pointer coordinate fallback ----
+s = input_p.read_text()
+old = '''    Rect? rect = ffiModel.rect;'''
+new = '''    // Direct MediaCodec Surface rendering does not deliver an RGBA image
+    // buffer. During startup/monitor transitions _rect can therefore lag behind
+    // the peer display metadata. Use the current display geometry as a safe
+    // coordinate-mapping fallback instead of dropping every mouse/touch event.
+    Rect? rect = ffiModel.rect ?? ffiModel.displaysRect();'''
+if old not in s:
+    raise SystemExit("v9 input rect target not found")
+s = s.replace(old, new, 1)
+input_p.write_text(s)
+
+# ---- Exported input diagnostics at the Rust bridge boundary ----
+s = ffi_p.read_text()
+
+old = '''pub fn session_send_pointer(session_id: SessionID, msg: String) {
+    super::flutter::session_send_pointer(session_id, msg);
+}'''
+new = '''pub fn session_send_pointer(session_id: SessionID, msg: String) {
+    #[cfg(all(target_os = "android", feature = "mediacodec"))]
+    scrap::mediacodec::diagnostic_note(format!("input pointer {}", msg));
+    super::flutter::session_send_pointer(session_id, msg);
+}'''
+if old not in s:
+    raise SystemExit("v9 session_send_pointer target not found")
+s = s.replace(old, new, 1)
+
+needle = '''        if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+            session.send_mouse(mask, x, y, alt, ctrl, shift, command);
+        }'''
+replacement = '''        #[cfg(all(target_os = "android", feature = "mediacodec"))]
+        if matches!(m.get("type").map(|v| v.as_str()), Some("down") | Some("up")) {
+            scrap::mediacodec::diagnostic_note(format!(
+                "input mouse type={} buttons={} x={} y={} mask={}",
+                m.get("type").map(|v| v.as_str()).unwrap_or(""),
+                m.get("buttons").map(|v| v.as_str()).unwrap_or(""),
+                x,
+                y,
+                mask
+            ));
+        }
+
+        if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+            session.send_mouse(mask, x, y, alt, ctrl, shift, command);
+        }'''
+if needle not in s:
+    raise SystemExit("v9 session_send_mouse send target not found")
+s = s.replace(needle, replacement, 1)
+ffi_p.write_text(s)
+
+print("Applied Android MediaCodec stall/input patch v9")
+PY9
+
+grep -nF "surface decoder stalled" "$MC"
+grep -nF "surface stall recovered" "$MC"
+grep -nF "ffiModel.rect ?? ffiModel.displaysRect()" "$INPUT_MODEL"
+grep -nF "input mouse type=" "$FLUTTER_FFI"
+grep -nF "input pointer" "$FLUTTER_FFI"
