@@ -2145,3 +2145,52 @@ grep -nF "surface stall recovered" "$MC"
 grep -nF "ffiModel.rect ?? ffiModel.displaysRect()" "$INPUT_MODEL"
 grep -nF "input mouse type=" "$FLUTTER_FFI"
 grep -nF "input pointer" "$FLUTTER_FFI"
+
+
+# v10: OutputBuffer borrows MediaCodec through Deref. Reset the consecutive
+# no-output counter only after release_output_buffer consumes that borrow.
+python3 - "$MC" <<'PY10'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text()
+
+old = '''        // no_output_count is consecutive, not cumulative.
+        self.no_output_count = 0;
+
+        if self.surface_mode {'''
+new = '''        if self.surface_mode {'''
+if old not in s:
+    raise SystemExit("v10 early no_output_count reset target not found")
+s = s.replace(old, new, 1)
+
+old = '''        if self.surface_mode {
+            self.release_output_buffer(output_buffer, true)?;
+            self.rendered_frames = self.rendered_frames.saturating_add(1);'''
+new = '''        if self.surface_mode {
+            self.release_output_buffer(output_buffer, true)?;
+            // OutputBuffer is consumed above; mutating self is borrow-safe here.
+            self.no_output_count = 0;
+            self.rendered_frames = self.rendered_frames.saturating_add(1);'''
+if old not in s:
+    raise SystemExit("v10 Surface release target not found")
+s = s.replace(old, new, 1)
+
+old = '''        self.release_output_buffer(output_buffer, false)?;
+        self.rendered_frames = self.rendered_frames.saturating_add(1);
+        Ok(true)'''
+new = '''        self.release_output_buffer(output_buffer, false)?;
+        // Successful ByteBuffer output also ends a consecutive no-output run.
+        self.no_output_count = 0;
+        self.rendered_frames = self.rendered_frames.saturating_add(1);
+        Ok(true)'''
+if old not in s:
+    raise SystemExit("v10 ByteBuffer release target not found")
+s = s.replace(old, new, 1)
+
+p.write_text(s)
+print("Applied MediaCodec no-output borrow fix v10")
+PY10
+
+grep -nF "self.no_output_count = 0;" "$MC"
