@@ -1472,3 +1472,182 @@ grep -nF "surface generation changed" "$MC"
 grep -nF "wait_for_output_surface" "$MC"
 grep -nF "stop_mediacodec" "$CODEC" "$CLIENT_RS"
 grep -nF "Surface geometry" "$SURFACE_KT"
+
+
+# Amlogic/Android 9 v4: slow TV boxes can create SurfaceView several seconds
+# after the session starts. Wait longer, then keep a color-format 21
+# (YUV420SemiPlanar/NV12) ByteBuffer path alive so late Surface generations can
+# still trigger the v3 automatic rebind to direct Surface rendering.
+python3 - "$MC" <<'PY4'
+from pathlib import Path
+import sys
+
+mc_p = Path(sys.argv[1])
+s = mc_p.read_text()
+
+old_import = 'use crate::{CodecFormat, I420ToABGR, I420ToARGB, ImageFormat, ImageRgb};'
+new_import = 'use crate::{CodecFormat, I420ToABGR, I420ToARGB, NV12ToABGR, NV12ToARGB, ImageFormat, ImageRgb};'
+if old_import not in s:
+    raise SystemExit("v4 libyuv import target not found")
+s = s.replace(old_import, new_import, 1)
+
+old_const = 'const COLOR_FORMAT_YUV420_PLANAR: i32 = 19;'
+new_const = '''const COLOR_FORMAT_YUV420_PLANAR: i32 = 19;
+const COLOR_FORMAT_YUV420_SEMIPLANAR: i32 = 21;'''
+if old_const not in s:
+    raise SystemExit("v4 color-format constant target not found")
+s = s.replace(old_const, new_const, 1)
+
+old_wait = 'wait_for_output_surface(Duration::from_millis(1500))'
+new_wait = 'wait_for_output_surface(Duration::from_millis(8000))'
+if old_wait not in s:
+    raise SystemExit("v4 surface wait target not found")
+s = s.replace(old_wait, new_wait, 1)
+
+start_marker = '        if color != COLOR_FORMAT_YUV420_PLANAR {'
+end_marker = '''        self.release_output_buffer(output_buffer, false)?;
+        Ok(true)'''
+start = s.find(start_marker)
+end = s.find(end_marker, start)
+if start < 0 or end < 0:
+    raise SystemExit("v4 ByteBuffer conversion block not found")
+
+new_block = r'''        let buf = output_buffer.buffer();
+        let bps = 4usize;
+        let y_stride = stride.max(0) as usize;
+        let slice_h = slice.max(0) as usize;
+        let y_size = y_stride.saturating_mul(slice_h);
+
+        rgb.w = w;
+        rgb.h = h;
+        rgb.raw.resize(h.saturating_mul(w).saturating_mul(bps), 0);
+
+        match color {
+            COLOR_FORMAT_YUV420_PLANAR => {
+                let uv_stride = (y_stride + 1) / 2;
+                let uv_height = (slice_h + 1) / 2;
+                let u = y_size;
+                let v = u.saturating_add(uv_stride.saturating_mul(uv_height));
+                let required = v.saturating_add(uv_stride.saturating_mul(uv_height));
+                if required > buf.len() {
+                    diag(format!(
+                        "ByteBuffer I420 bounds invalid codec={} bytes={} required={} y={} u={} v={}",
+                        self.name, buf.len(), required, y_size, u, v
+                    ));
+                    self.release_output_buffer(output_buffer, false)?;
+                    bail!("invalid MediaCodec I420 plane bounds");
+                }
+
+                unsafe {
+                    match rgb.fmt() {
+                        ImageFormat::ARGB => {
+                            I420ToARGB(
+                                buf.as_ptr(),
+                                stride,
+                                buf[u..].as_ptr(),
+                                uv_stride as i32,
+                                buf[v..].as_ptr(),
+                                uv_stride as i32,
+                                rgb.raw.as_mut_ptr(),
+                                (w * bps) as i32,
+                                w as i32,
+                                h as i32,
+                            );
+                        }
+                        ImageFormat::ABGR => {
+                            I420ToABGR(
+                                buf.as_ptr(),
+                                stride,
+                                buf[u..].as_ptr(),
+                                uv_stride as i32,
+                                buf[v..].as_ptr(),
+                                uv_stride as i32,
+                                rgb.raw.as_mut_ptr(),
+                                (w * bps) as i32,
+                                w as i32,
+                                h as i32,
+                            );
+                        }
+                        _ => {
+                            self.release_output_buffer(output_buffer, false)?;
+                            bail!("unsupported RGB destination format");
+                        }
+                    }
+                }
+            }
+            COLOR_FORMAT_YUV420_SEMIPLANAR => {
+                // Android COLOR_FormatYUV420SemiPlanar (21). Amlogic's OMX
+                // decoder exposes this as a single interleaved UV plane here.
+                let uv = y_size;
+                let uv_height = (slice_h + 1) / 2;
+                let required = uv.saturating_add(y_stride.saturating_mul(uv_height));
+                if required > buf.len() {
+                    diag(format!(
+                        "ByteBuffer NV12 bounds invalid codec={} bytes={} required={} y={} uv={}",
+                        self.name, buf.len(), required, y_size, uv
+                    ));
+                    self.release_output_buffer(output_buffer, false)?;
+                    bail!("invalid MediaCodec NV12 plane bounds");
+                }
+
+                if self.rendered_frames < 5 {
+                    diag(format!(
+                        "ByteBuffer NV12 frame codec={} color=21 stride={} slice={} bytes={}",
+                        self.name, stride, slice, buf.len()
+                    ));
+                }
+                self.rendered_frames = self.rendered_frames.saturating_add(1);
+
+                unsafe {
+                    match rgb.fmt() {
+                        ImageFormat::ARGB => {
+                            NV12ToARGB(
+                                buf.as_ptr(),
+                                stride,
+                                buf[uv..].as_ptr(),
+                                stride,
+                                rgb.raw.as_mut_ptr(),
+                                (w * bps) as i32,
+                                w as i32,
+                                h as i32,
+                            );
+                        }
+                        ImageFormat::ABGR => {
+                            NV12ToABGR(
+                                buf.as_ptr(),
+                                stride,
+                                buf[uv..].as_ptr(),
+                                stride,
+                                rgb.raw.as_mut_ptr(),
+                                (w * bps) as i32,
+                                w as i32,
+                                h as i32,
+                            );
+                        }
+                        _ => {
+                            self.release_output_buffer(output_buffer, false)?;
+                            bail!("unsupported RGB destination format");
+                        }
+                    }
+                }
+            }
+            _ => {
+                diag(format!(
+                    "ByteBuffer unsupported format codec={} color={} stride={} slice={}",
+                    self.name, color, stride, slice
+                ));
+                self.release_output_buffer(output_buffer, false)?;
+                bail!("unsupported MediaCodec ByteBuffer color format");
+            }
+        }
+
+'''
+s = s[:start] + new_block + s[end:]
+mc_p.write_text(s)
+
+print("Applied Android MediaCodec Amlogic fallback patch v4")
+PY4
+
+grep -nF "from_millis(8000)" "$MC"
+grep -nF "COLOR_FORMAT_YUV420_SEMIPLANAR" "$MC"
+grep -nF "ByteBuffer NV12 frame" "$MC"
