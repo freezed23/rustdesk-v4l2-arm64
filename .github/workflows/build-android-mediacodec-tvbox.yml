@@ -2,12 +2,9 @@ name: Build RustDesk Android TV MediaCodec ARM64
 # rebuild-trigger: 2
 
 on:
+  # ARM64/S23 is intentionally manual-only while Android TV ARMv7 debugging
+  # is active, so android/** patch commits do not launch two expensive builds.
   workflow_dispatch:
-  push:
-    branches: [ main ]
-    paths:
-      - '.github/workflows/build-android-mediacodec-tvbox.yml'
-      - 'android/**'
 
 env:
   RUSTDESK_COMMIT: 6c578292e
