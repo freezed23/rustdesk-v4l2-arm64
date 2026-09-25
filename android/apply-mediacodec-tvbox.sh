@@ -1700,3 +1700,190 @@ print("Applied Android MediaCodec NV12 borrow fix v5")
 PY5
 
 grep -nF "log_bytebuffer_frame" "$MC"
+
+
+# v6: Android PlatformView must not consume RustDesk pointer gestures. Also fully
+# release the old AMediaCodec before a monitor/surface rebind; AMediaCodec_stop()
+# alone is not enough on Amlogic OMX and can make subsequent configure() fail.
+python3 - "$MC" "$CODEC" "$CLIENT_RS" "$REMOTE_PAGE" <<'PY6'
+from pathlib import Path
+import sys
+
+mc_p, codec_p, client_p, remote_page_p = map(Path, sys.argv[1:])
+
+# ---- MediaCodec ownership/release ----
+s = mc_p.read_text()
+
+old = '''pub struct MediaCodecDecoder {
+    decoder: MediaCodec,
+    name: String,
+    format: CodecFormat,
+    surface_mode: bool,
+    surface_generation: u64,
+    queued_frames: u64,
+    rendered_frames: u64,
+    no_output_count: u64,
+}'''
+new = '''pub struct MediaCodecDecoder {
+    decoder: Option<MediaCodec>,
+    name: String,
+    format: CodecFormat,
+    surface_mode: bool,
+    surface_generation: u64,
+    queued_frames: u64,
+    rendered_frames: u64,
+    no_output_count: u64,
+}'''
+if old not in s:
+    raise SystemExit("v6 MediaCodecDecoder Option target not found")
+s = s.replace(old, new, 1)
+
+old = '''    fn deref(&self) -> &Self::Target {
+        &self.decoder
+    }'''
+new = '''    fn deref(&self) -> &Self::Target {
+        self.decoder
+            .as_ref()
+            .expect("MediaCodec decoder already released")
+    }'''
+if old not in s:
+    raise SystemExit("v6 MediaCodecDecoder Deref target not found")
+s = s.replace(old, new, 1)
+
+old = '''            let _ = self.decoder.stop();
+
+            if let Some(replacement) = create_media_codec_for_format(format.clone(), false, false) {'''
+new = '''            if let Some(old_decoder) = self.decoder.take() {
+                let _ = old_decoder.stop();
+                drop(old_decoder);
+            }
+            // Amlogic OMX can return ErrorUnknown if a new decoder is configured
+            // immediately after AMediaCodec_delete. Give the vendor service a
+            // short release window before acquiring the next surface decoder.
+            std::thread::sleep(Duration::from_millis(120));
+
+            if let Some(replacement) = create_media_codec_for_format(format.clone(), false, false) {'''
+if old not in s:
+    raise SystemExit("v6 surface rebind release target not found")
+s = s.replace(old, new, 1)
+
+old = '''    Some(MediaCodecDecoder {
+        decoder,
+        name: selected_name,'''
+new = '''    Some(MediaCodecDecoder {
+        decoder: Some(decoder),
+        name: selected_name,'''
+if old not in s:
+    raise SystemExit("v6 MediaCodecDecoder constructor target not found")
+s = s.replace(old, new, 1)
+
+mc_p.write_text(s)
+
+# ---- Decoder reset: take/drop old MediaCodec before creating replacement ----
+s = codec_p.read_text()
+old = '''    #[cfg(feature = "mediacodec")]
+    pub fn stop_mediacodec(&mut self) {
+        if let Some(decoder) = &mut self.h264_media_codec {
+            let _ = decoder.stop();
+        }
+        if let Some(decoder) = &mut self.h265_media_codec {
+            let _ = decoder.stop();
+        }
+    }'''
+new = '''    #[cfg(feature = "mediacodec")]
+    pub fn stop_mediacodec(&mut self) {
+        if let Some(decoder) = self.h264_media_codec.take() {
+            let _ = decoder.stop();
+            drop(decoder);
+        }
+        if let Some(decoder) = self.h265_media_codec.take() {
+            let _ = decoder.stop();
+            drop(decoder);
+        }
+    }'''
+if old not in s:
+    raise SystemExit("v6 stop_mediacodec target not found")
+s = s.replace(old, new, 1)
+codec_p.write_text(s)
+
+s = client_p.read_text()
+
+old = '''        #[cfg(feature = "mediacodec")]
+        self.decoder.stop_mediacodec();
+        self.decoder = Decoder::new(format, luid);'''
+new = '''        #[cfg(feature = "mediacodec")]
+        {
+            self.decoder.stop_mediacodec();
+            std::thread::sleep(Duration::from_millis(120));
+        }
+        self.decoder = Decoder::new(format, luid);'''
+if old not in s:
+    raise SystemExit("v6 VideoHandler reset release target not found")
+s = s.replace(old, new, 1)
+
+# A transient Android SurfaceView recreation must not permanently remove H264/H265
+# from the codec menu. The capability probe is sticky; keep these codecs advertised
+# and let the decoder recreate after the new Surface generation appears.
+old = '''                        if let Some(handler) = video_handler.as_mut() {
+                            if !handler.decoder.valid()
+                                || handler.fail_counter >= MAX_DECODE_FAIL_COUNTER
+                            {
+                                let mut lc = session.lc.write().unwrap();
+                                let format = handler.decoder.format();
+                                if !lc.mark_unsupported.contains(&format) {
+                                    lc.mark_unsupported.push(format);
+                                    should_update_supported = true;
+                                    log::info!("mark {format:?} decoder as unsupported, valid:{}, fail_counter:{}, all unsupported:{:?}", handler.decoder.valid(), handler.fail_counter, lc.mark_unsupported);
+                                }
+                            }
+                        }'''
+new = '''                        if let Some(handler) = video_handler.as_mut() {
+                            #[cfg(all(target_os = "android", feature = "mediacodec"))]
+                            let transient_surface_codec = matches!(
+                                handler.decoder.format(),
+                                CodecFormat::H264 | CodecFormat::H265
+                            );
+                            #[cfg(not(all(target_os = "android", feature = "mediacodec")))]
+                            let transient_surface_codec = false;
+
+                            if (!handler.decoder.valid()
+                                || handler.fail_counter >= MAX_DECODE_FAIL_COUNTER)
+                                && !transient_surface_codec
+                            {
+                                let mut lc = session.lc.write().unwrap();
+                                let format = handler.decoder.format();
+                                if !lc.mark_unsupported.contains(&format) {
+                                    lc.mark_unsupported.push(format);
+                                    should_update_supported = true;
+                                    log::info!("mark {format:?} decoder as unsupported, valid:{}, fail_counter:{}, all unsupported:{:?}", handler.decoder.valid(), handler.fail_counter, lc.mark_unsupported);
+                                }
+                            }
+                        }'''
+if old not in s:
+    raise SystemExit("v6 mark_unsupported target not found")
+s = s.replace(old, new, 1)
+
+client_p.write_text(s)
+
+# ---- Pointer/touch passthrough ----
+s = remote_page_p.read_text()
+old = '''                  child: AndroidView(viewType: "rustdesk/mediacodec_surface"),'''
+new = '''                  child: AndroidView(
+                    viewType: "rustdesk/mediacodec_surface",
+                    // The SurfaceView is video-only. RustDesk's outer
+                    // RawPointerMouseRegion / RawTouchGestureDetectorRegion must
+                    // receive left/right mouse and touch gestures.
+                    hitTestBehavior: PlatformViewHitTestBehavior.transparent,
+                  ),'''
+if old not in s:
+    raise SystemExit("v6 AndroidView hitTest target not found")
+s = s.replace(old, new, 1)
+remote_page_p.write_text(s)
+
+print("Applied Android MediaCodec input/lifecycle patch v6")
+PY6
+
+grep -nF "PlatformViewHitTestBehavior.transparent" "$REMOTE_PAGE"
+grep -nF "decoder: Option<MediaCodec>" "$MC"
+grep -nF "old_decoder) = self.decoder.take" "$MC"
+grep -nF "transient_surface_codec" "$CLIENT_RS"
