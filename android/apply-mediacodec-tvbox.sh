@@ -1887,3 +1887,65 @@ grep -nF "PlatformViewHitTestBehavior.transparent" "$REMOTE_PAGE"
 grep -nF "decoder: Option<MediaCodec>" "$MC"
 grep -nF "old_decoder) = self.decoder.take" "$MC"
 grep -nF "transient_surface_codec" "$CLIENT_RS"
+
+
+# v7: Android 9 log export must not depend on READ/WRITE_EXTERNAL_STORAGE
+# runtime grants. API 29+ keeps MediaStore Downloads; API 28 and lower use the
+# app-specific external Download directory, which needs no storage permission.
+python3 - "$SURFACE_KT" "$SETTINGS_PAGE" <<'PY7'
+from pathlib import Path
+import sys
+
+surface_p, settings_p = map(Path, sys.argv[1:])
+
+s = surface_p.read_text()
+old = '''        @Suppress("DEPRECATION")
+        val base = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val dir = File(base, "RustDesk-MC")
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw IllegalStateException("Cannot create " + dir.absolutePath)
+        }
+        val out = File(dir, fileName)
+        out.writeText(body)
+        return out.absolutePath'''
+new = '''        // Android 9 and older require runtime WRITE_EXTERNAL_STORAGE for the
+        // public Download directory. Use app-specific external storage instead:
+        // /storage/emulated/0/Android/data/<package>/files/Download/RustDesk-MC
+        // This remains adb-pullable and needs no READ/WRITE storage grant.
+        val base = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+            ?: throw IllegalStateException("External app storage unavailable")
+        val dir = File(base, "RustDesk-MC")
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw IllegalStateException("Cannot create " + dir.absolutePath)
+        }
+        val out = File(dir, fileName)
+        out.writeText(body)
+        return out.absolutePath'''
+if old not in s:
+    raise SystemExit("v7 Android 9 log exporter target not found")
+s = s.replace(old, new, 1)
+surface_p.write_text(s)
+
+s = settings_p.read_text()
+old = '''              description: const Text('Save to Download/RustDesk-MC'),'''
+new = '''              description: const Text('Save MediaCodec diagnostics without storage permission'),'''
+if old not in s:
+    raise SystemExit("v7 settings description target not found")
+s = s.replace(old, new, 1)
+
+old = '''                  showToast(ok == true
+                      ? 'Saved to Download/RustDesk-MC'
+                      : 'MediaCodec log export failed');'''
+new = '''                  showToast(ok == true
+                      ? 'MediaCodec debug log saved'
+                      : 'MediaCodec log export failed');'''
+if old not in s:
+    raise SystemExit("v7 settings toast target not found")
+s = s.replace(old, new, 1)
+settings_p.write_text(s)
+
+print("Applied Android MediaCodec log storage patch v7")
+PY7
+
+grep -nF "getExternalFilesDir" "$SURFACE_KT"
+grep -nF "without storage permission" "$SETTINGS_PAGE"
