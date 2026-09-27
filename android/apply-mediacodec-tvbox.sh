@@ -2344,3 +2344,52 @@ PY11
 grep -nF "requesting video refresh" "$MC"
 grep -nF "behavior: HitTestBehavior.translucent" "$REMOTE_INPUT"
 grep -nF "rect.width <= 0" "$INPUT_MODEL"
+
+
+# v12: The first ByteBuffer fallback frame remains in ImageModel when MediaCodec
+# switches to direct Surface rendering. AndroidView is intentionally the first
+# Stack child and ImagePaint is above it, so that stale RGBA image can cover the
+# live Surface forever. Clear and repaint ImageModel as soon as the first direct
+# surface frame event arrives. Software VP8/VP9 will repopulate ImageModel on the
+# next RGBA frame automatically.
+python3 - "$MODEL_DART" <<'PY12'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text()
+
+old = '''  clearImage() => _image = null;'''
+new = '''  clearImage() => _image = null;
+
+  void clearForDirectSurface() {
+    if (_image == null) return;
+    _image?.dispose();
+    _image = null;
+    notifyListeners();
+  }'''
+if old not in s:
+    raise SystemExit("v12 ImageModel clearImage target not found")
+s = s.replace(old, new, 1)
+
+old = '''            if (event['name'] == 'surface_frame') {
+              onEvent2UIRgba();
+            }
+            await cb(event);'''
+new = '''            if (event['name'] == 'surface_frame') {
+              // A ByteBuffer fallback frame may still be painted above the
+              // Android SurfaceView. Remove it once direct Surface rendering
+              // proves that a frame was submitted.
+              imageModel.clearForDirectSurface();
+              onEvent2UIRgba();
+            }
+            await cb(event);'''
+if old not in s:
+    raise SystemExit("v12 surface_frame event target not found")
+s = s.replace(old, new, 1)
+
+p.write_text(s)
+print("Applied direct-Surface stale ImagePaint fix v12")
+PY12
+
+grep -nF "clearForDirectSurface" "$MODEL_DART"
