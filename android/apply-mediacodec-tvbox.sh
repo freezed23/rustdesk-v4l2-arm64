@@ -2215,3 +2215,132 @@ print("Applied Android MediaCodec Flutter hit-test import patch v8")
 PY8
 
 grep -nF "package:flutter/rendering.dart" "$REMOTE_PAGE"
+
+
+# v11: Direct MediaCodec Surface needs explicit refresh after decoder recreation,
+# and the Flutter input regions must hit-test even when the video is rendered by
+# an Android SurfaceView rather than ImagePaint. Keep RustDesk's existing Android
+# peer semantics: left click -> tap/drag, right click -> Android long-press.
+REMOTE_INPUT="$ROOT/flutter/lib/common/widgets/remote_input.dart"
+
+python3 - "$MC" "$REMOTE_INPUT" "$INPUT_MODEL" <<'PY11'
+from pathlib import Path
+import sys
+
+mc_p, remote_input_p, input_p = map(Path, sys.argv[1:])
+
+# ---- MediaCodec recreation -> force upstream keyframe/refresh ----
+s = mc_p.read_text()
+
+targets = [
+(
+'''                diag(format!(
+                    "decoder rebound format={:?} surface={} generation={}",
+                    format, rebound_surface, self.surface_generation
+                ));''',
+'''                diag(format!(
+                    "decoder rebound format={:?} surface={} generation={}; requesting video refresh",
+                    format, rebound_surface, self.surface_generation
+                ));
+                // The fresh codec may receive only inter frames from the old
+                // stream. Return an error intentionally so client.rs calls
+                // session.refresh_video(display), forcing a new keyframe.
+                bail!("MediaCodec surface rebound requires video refresh");'''
+),
+(
+'''                diag(format!(
+                    "surface rebind failed; ByteBuffer fallback format={:?} generation={}",
+                    format, self.surface_generation
+                ));''',
+'''                diag(format!(
+                    "surface rebind failed; ByteBuffer fallback format={:?} generation={}; requesting video refresh",
+                    format, self.surface_generation
+                ));
+                bail!("MediaCodec ByteBuffer rebind requires video refresh");'''
+),
+(
+'''                    diag(format!(
+                        "surface stall recovered format={:?} surface={} generation={}",
+                        format, self.surface_mode, self.surface_generation
+                    ));''',
+'''                    diag(format!(
+                        "surface stall recovered format={:?} surface={} generation={}; requesting video refresh",
+                        format, self.surface_mode, self.surface_generation
+                    ));
+                    bail!("MediaCodec stall recovery requires video refresh");'''
+),
+(
+'''                    diag(format!(
+                        "surface stall recovery fell back to ByteBuffer format={:?} generation={}",
+                        format, self.surface_generation
+                    ));''',
+'''                    diag(format!(
+                        "surface stall recovery fell back to ByteBuffer format={:?} generation={}; requesting video refresh",
+                        format, self.surface_generation
+                    ));
+                    bail!("MediaCodec stall ByteBuffer recovery requires video refresh");'''
+),
+]
+
+for old, new in targets:
+    if old not in s:
+        raise SystemExit("v11 MediaCodec refresh target not found: " + old.splitlines()[1].strip())
+    s = s.replace(old, new, 1)
+
+mc_p.write_text(s)
+
+# ---- Force Flutter pointer/touch hit testing over direct Surface ----
+s = remote_input_p.read_text()
+
+imp = "import 'package:flutter/rendering.dart' show HitTestBehavior;\n"
+if imp not in s:
+    anchor = "import 'package:flutter/material.dart';\n"
+    if anchor not in s:
+        raise SystemExit("v11 remote_input material import anchor not found")
+    s = s.replace(anchor, anchor + imp, 1)
+
+raw_touch_idx = s.find("class _RawTouchGestureDetectorRegionState")
+if raw_touch_idx < 0:
+    raise SystemExit("v11 RawTouchGestureDetectorRegion class not found")
+raw_touch_listener = s.find("return RawGestureDetector(", raw_touch_idx)
+if raw_touch_listener < 0:
+    raise SystemExit("v11 RawGestureDetector return not found")
+needle = "return RawGestureDetector(\n      child: widget.child,"
+if not s.startswith(needle, raw_touch_listener):
+    raise SystemExit("v11 RawGestureDetector shape changed")
+replacement = "return RawGestureDetector(\n      behavior: HitTestBehavior.translucent,\n      child: widget.child,"
+s = s[:raw_touch_listener] + replacement + s[raw_touch_listener + len(needle):]
+
+raw_mouse_idx = s.find("class RawPointerMouseRegion")
+if raw_mouse_idx < 0:
+    raise SystemExit("v11 RawPointerMouseRegion class not found")
+raw_mouse_listener = s.find("return Listener(", raw_mouse_idx)
+if raw_mouse_listener < 0:
+    raise SystemExit("v11 RawPointerMouseRegion Listener not found")
+needle = "return Listener(\n      onPointerHover:"
+if not s.startswith(needle, raw_mouse_listener):
+    raise SystemExit("v11 RawPointerMouseRegion Listener shape changed")
+replacement = "return Listener(\n      behavior: HitTestBehavior.translucent,\n      onPointerHover:"
+s = s[:raw_mouse_listener] + replacement + s[raw_mouse_listener + len(needle):]
+
+remote_input_p.write_text(s)
+
+# ---- Direct Surface may leave a stale/zero FFI image rect. Use peer display
+# metadata for input coordinates when the image-backed rect is invalid. ----
+s = input_p.read_text()
+old = '''    Rect? rect = ffiModel.rect ?? ffiModel.displaysRect();'''
+new = '''    Rect? rect = ffiModel.rect;
+    if (rect == null || rect.width <= 0 || rect.height <= 0) {
+      rect = ffiModel.displaysRect();
+    }'''
+if old not in s:
+    raise SystemExit("v11 input rect fallback target not found")
+s = s.replace(old, new, 1)
+input_p.write_text(s)
+
+print("Applied Android direct-Surface input/keyframe patch v11")
+PY11
+
+grep -nF "requesting video refresh" "$MC"
+grep -nF "behavior: HitTestBehavior.translucent" "$REMOTE_INPUT"
+grep -nF "rect.width <= 0" "$INPUT_MODEL"
